@@ -169,7 +169,7 @@ async def reset_cover(book: OwnedBook, session: SessionDep) -> BookOut:
 async def get_cover(book: OwnedBook) -> FileResponse:
     if book.cover_path is None or not Path(book.cover_path).exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No cover available")
-    return FileResponse(book.cover_path, headers={"Cache-Control": "private, max-age=86400"})
+    return FileResponse(book.cover_path, headers={"Cache-Control": "private, no-cache"})
 
 
 @router.get("/{book_id}/file")

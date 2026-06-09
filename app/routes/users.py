@@ -46,7 +46,7 @@ async def upload_avatar(file: UploadFile, user: CurrentUser, session: SessionDep
 async def get_avatar(user: CurrentUser) -> FileResponse:
     if user.avatar_path is None or not Path(user.avatar_path).exists():
         raise HTTPException(status.HTTP_404_NOT_FOUND, "No avatar uploaded")
-    return FileResponse(user.avatar_path, headers={"Cache-Control": "private, max-age=3600"})
+    return FileResponse(user.avatar_path, headers={"Cache-Control": "private, no-cache"})
 
 
 @router.get("/me/stats")
