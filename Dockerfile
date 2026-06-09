@@ -8,7 +8,7 @@ ENV UV_COMPILE_BYTECODE=1 \
     HF_HOME=/app/data/models
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends espeak-ng curl \
+    && apt-get install -y --no-install-recommends espeak-ng curl ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

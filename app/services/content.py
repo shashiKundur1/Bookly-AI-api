@@ -61,6 +61,40 @@ def find_chunk(content: dict[str, Any], chunk_id: str) -> dict[str, Any] | None:
     return None
 
 
+def adjacent_chunk(
+    content: dict[str, Any], chunk_id: str, direction: int
+) -> dict[str, Any] | None:
+    try:
+        page_number = int(chunk_id.split("-", 1)[0])
+    except ValueError:
+        return None
+    page_chunks = _page_chunks(content, page_number)
+    index = next((i for i, chunk in enumerate(page_chunks) if chunk["id"] == chunk_id), None)
+    if index is None:
+        return None
+    target = index + direction
+    if 0 <= target < len(page_chunks):
+        return page_chunks[target]
+    step = 1 if direction > 0 else -1
+    page = page_number + step
+    while 1 <= page <= len(content["pages"]):
+        candidates = _page_chunks(content, page)
+        if candidates:
+            return candidates[0] if step > 0 else candidates[-1]
+        page += step
+    return None
+
+
+def first_chunk_at_or_after(content: dict[str, Any], page_number: int) -> dict[str, Any] | None:
+    page = max(1, page_number)
+    while page <= len(content["pages"]):
+        candidates = _page_chunks(content, page)
+        if candidates:
+            return candidates[0]
+        page += 1
+    return None
+
+
 def chunks_after(content: dict[str, Any], chunk_id: str, count: int) -> list[dict[str, Any]]:
     try:
         page_number = int(chunk_id.split("-", 1)[0])
