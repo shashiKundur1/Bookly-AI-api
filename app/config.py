@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     max_upload_mb: int = 200
     max_image_mb: int = 10
     default_voice: str = "af_heart"
+    tts_engine: str = "kokoro"
     gemini_api_key: str = ""
 
     @property

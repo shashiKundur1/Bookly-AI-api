@@ -14,6 +14,8 @@ from app.config import get_settings
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
+ONNX_MODEL_FILE = "kokoro-v1.0.int8.onnx"
+ONNX_VOICES_FILE = "voices-v1.0.bin"
 
 VOICES = [
     {"id": "af_heart", "name": "Heart", "gender": "female", "accent": "american"},
@@ -26,13 +28,13 @@ VOICES = [
 VOICE_IDS = {voice["id"] for voice in VOICES}
 
 
-def _wav_bytes(samples: np.ndarray) -> bytes:
+def _wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
     pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2")
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as writer:
         writer.setnchannels(1)
         writer.setsampwidth(2)
-        writer.setframerate(SAMPLE_RATE)
+        writer.setframerate(sample_rate)
         writer.writeframes(pcm.tobytes())
     return buffer.getvalue()
 
@@ -65,8 +67,30 @@ def _words_from_tokens(tokens: list[Any], offset: float) -> list[dict[str, Any]]
 
 class SpeechEngine:
     def __init__(self) -> None:
-        self._pipelines: dict[str, Any] = {}
         self._lock = asyncio.Lock()
+
+    def _synthesize(self, text: str, voice: str) -> tuple[bytes, list[dict[str, Any]]]:
+        raise NotImplementedError
+
+    async def synthesize_to_file(self, text: str, voice: str, path: Path) -> Path:
+        if path.exists():
+            return path
+        async with self._lock:
+            if path.exists():
+                return path
+            audio, words = await asyncio.to_thread(self._synthesize, text, voice)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp = path.with_name(f"{path.name}.tmp")
+            temp.write_bytes(audio)
+            temp.rename(path)
+            timing_path(path).write_text(json.dumps({"words": words}, ensure_ascii=False))
+            return path
+
+
+class TorchSpeechEngine(SpeechEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self._pipelines: dict[str, Any] = {}
 
     def _pipeline(self, lang_code: str):
         pipeline = self._pipelines.get(lang_code)
@@ -90,24 +114,40 @@ class SpeechEngine:
             offset += len(audio) / SAMPLE_RATE
             segments.append(audio)
         combined = np.concatenate(segments) if segments else np.zeros(1, dtype=np.float32)
-        return _wav_bytes(combined), words
-
-    async def synthesize_to_file(self, text: str, voice: str, path: Path) -> Path:
-        if path.exists():
-            return path
-        async with self._lock:
-            if path.exists():
-                return path
-            audio, words = await asyncio.to_thread(self._synthesize, text, voice)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp = path.with_name(f"{path.name}.tmp")
-            temp.write_bytes(audio)
-            temp.rename(path)
-            timing_path(path).write_text(json.dumps({"words": words}, ensure_ascii=False))
-            return path
+        return _wav_bytes(combined, SAMPLE_RATE), words
 
 
-engine = SpeechEngine()
+class OnnxSpeechEngine(SpeechEngine):
+    def __init__(self) -> None:
+        super().__init__()
+        self._kokoro: Any = None
+
+    def _load(self):
+        if self._kokoro is None:
+            from kokoro_onnx import Kokoro
+
+            settings = get_settings()
+            self._kokoro = Kokoro(
+                str(settings.models_dir / ONNX_MODEL_FILE),
+                str(settings.models_dir / ONNX_VOICES_FILE),
+            )
+        return self._kokoro
+
+    def _synthesize(self, text: str, voice: str) -> tuple[bytes, list[dict[str, Any]]]:
+        kokoro = self._load()
+        lang = "en-gb" if voice.startswith("b") else "en-us"
+        samples, sample_rate = kokoro.create(text, voice=voice, speed=1.0, lang=lang)
+        combined = np.asarray(samples, dtype=np.float32)
+        return _wav_bytes(combined, sample_rate), []
+
+
+def _create_engine() -> SpeechEngine:
+    if get_settings().tts_engine == "kokoro-onnx":
+        return OnnxSpeechEngine()
+    return TorchSpeechEngine()
+
+
+engine = _create_engine()
 
 _prefetch_tasks: set[asyncio.Task] = set()
 

@@ -15,10 +15,12 @@ dependencies = [
     "pwdlib[argon2]>=0.3",
     "python-multipart>=0.0.32",
     "pymupdf>=1.27",
-    "kokoro>=0.9.4",
-    "en-core-web-sm",
     "numpy>=1.26",
 ]
+
+[project.optional-dependencies]
+tts-torch = ["kokoro>=0.9.4", "en-core-web-sm"]
+tts-onnx = ["kokoro-onnx>=0.5"]
 
 [dependency-groups]
 dev = ["httpx>=0.28"]
