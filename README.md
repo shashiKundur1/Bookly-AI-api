@@ -70,8 +70,21 @@ npx newman run postman/bookly-api.postman_collection.json \
 
 It covers the happy paths, auth failures, validation errors, range streaming, reorder persistence, narration synthesis and cleanup.
 
-## Production notes
+## Production
 
-- The image is large (~9 GB) because Kokoro runs on PyTorch; if you never need word timestamps you can swap to `kokoro-onnx` for a ~10x smaller image.
+With this repo and [Bookly-AI-client](https://github.com/shashiKundur1/Bookly-AI-client) cloned side by side:
+
+```bash
+JWT_SECRET=$(openssl rand -hex 32) docker compose -f docker-compose.prod.yml up -d --build
+```
+
+That starts Postgres (internal only), the API (TTS warmed on boot, health-checked, auto-restarting), and the web app on port 3000. Set `POSTGRES_PASSWORD`, `CORS_ORIGINS`, and `COOKIE_SECURE` through the environment or a `.env` file next to the compose file.
+
+The API ships with a caching layer: content endpoints answer conditional requests with ETags and 304s, narration audio and word timings are cached for a week, the voice list is publicly cacheable for a day, and JSON responses are gzip-compressed. Security headers (nosniff, frame deny, referrer policy) are applied to every response.
+
+Worth knowing before exposing it to the internet:
+
+- Terminate TLS in front (Caddy, nginx, Traefik) and keep `COOKIE_SECURE=true`.
+- The image is large (~9 GB) because Kokoro runs on PyTorch; swap to `kokoro-onnx` for a ~10x smaller image if you can live without word timestamps.
 - PyMuPDF is AGPL-licensed: fine for personal use, review the license before offering this as a hosted service.
-- Put the API behind HTTPS, set `COOKIE_SECURE=true`, use a managed Postgres, and add a rate limiter at the proxy layer before exposing it publicly.
+- Add a rate limiter at the proxy layer.
