@@ -183,17 +183,14 @@ async def _narration_receiver(
             elif kind == "ack":
                 session.acked = True
             elif kind == "seek":
-                target = None
                 chunk_id = message.get("chunk")
                 direction = message.get("direction")
-                if isinstance(chunk_id, str):
-                    chunk = find_chunk(content, chunk_id)
-                    target = chunk["id"] if chunk else None
-                elif direction in (1, -1) and session.current is not None:
-                    chunk = adjacent_chunk(content, session.current, direction)
-                    target = chunk["id"] if chunk else None
-                if target is not None:
-                    session.pending = target
+                base = chunk_id if isinstance(chunk_id, str) else session.pending or session.current
+                chunk = find_chunk(content, base) if base else None
+                if chunk is not None and direction in (1, -1):
+                    chunk = adjacent_chunk(content, chunk["id"], direction) or chunk
+                if chunk is not None:
+                    session.pending = chunk["id"]
                     session.flush = True
             elif kind == "voice":
                 voice = message.get("voice")
