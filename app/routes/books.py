@@ -88,6 +88,7 @@ async def upload_book(
     )
     session.add(book)
     await session.commit()
+    await session.refresh(book, ["progress"])
     background.add_task(process_book, book.id, title is None, author is None)
     return BookOut.from_model(book)
 
@@ -110,11 +111,22 @@ async def get_book(book: OwnedBook) -> BookOut:
     return BookOut.from_model(book)
 
 
+@router.post("/{book_id}/reprocess")
+async def reprocess_book(book: OwnedBook, session: SessionDep, background: BackgroundTasks) -> BookOut:
+    book.extraction_status = "pending"
+    book.extraction_error = None
+    await session.commit()
+    await session.refresh(book)
+    background.add_task(process_book, book.id, False, False)
+    return BookOut.from_model(book)
+
+
 @router.patch("/{book_id}")
 async def update_book(payload: BookUpdate, book: OwnedBook, session: SessionDep) -> BookOut:
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(book, field, value)
     await session.commit()
+    await session.refresh(book)
     return BookOut.from_model(book)
 
 
@@ -132,6 +144,7 @@ async def upload_cover(file: UploadFile, book: OwnedBook, session: SessionDep) -
     book.cover_path = str(path)
     book.has_custom_cover = True
     await session.commit()
+    await session.refresh(book)
     return BookOut.from_model(book)
 
 
@@ -148,6 +161,7 @@ async def reset_cover(book: OwnedBook, session: SessionDep) -> BookOut:
         book.cover_path = None
     book.has_custom_cover = False
     await session.commit()
+    await session.refresh(book)
     return BookOut.from_model(book)
 
 

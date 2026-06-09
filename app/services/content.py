@@ -23,6 +23,13 @@ def invalidate(book_id: uuid.UUID) -> None:
         _order.remove(book_id)
 
 
+async def save_content(book_id: uuid.UUID, data: dict[str, Any]) -> None:
+    path = content_path(book_id)
+    text = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    await anyio.to_thread.run_sync(path.write_text, text)
+    _cache[book_id] = data
+
+
 async def load_content(book_id: uuid.UUID) -> dict[str, Any] | None:
     if book_id in _cache:
         return _cache[book_id]

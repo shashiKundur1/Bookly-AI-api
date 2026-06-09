@@ -9,14 +9,16 @@ from app.services.narration import build_chunks
 
 MARGIN_BAND = 0.08
 REPEAT_MIN_PAGES = 3
-REPEAT_RATIO = 0.18
+REPEAT_RATIO = 0.01
 BOLD_FLAG = 16
 MAX_HEADING_CHARS = 120
 
 WHITESPACE = re.compile(r"\s+")
 DIGITS = re.compile(r"\d+")
 PAGE_LABEL = re.compile(r"^[\s.\-–—·]*(?:\d{1,4}|[ivxlcdm]{1,8}|[IVXLCDM]{1,8})[\s.\-–—·]*$")
-LIST_MARKER = re.compile(r"^\s*(?:[•▪◦‣·∙○●♦►▶]|\d{1,3}[.)]|[a-zA-Z][.)])\s+")
+LEADING_PAGE = re.compile(r"^(?:\d{1,3}|[ivxlcdm]{1,8}|[IVXLCDM]{1,8})(?:\s+|$)")
+TRAILING_PAGE = re.compile(r"\s+\d{1,4}$")
+LIST_MARKER = re.compile(r"^\s*(?:[•▪■□◦‣·∙○●♦►▶]|\d{1,3}[.)]|[a-zA-Z][.)])\s+")
 TERMINAL = (".", "!", "?", ":", ";")
 
 
@@ -25,10 +27,13 @@ def extract_book(pdf_path: Path) -> dict[str, Any]:
         toc = _table_of_contents(doc)
         body_size, repeated_margins = _document_profile(doc)
         toc_by_page = _toc_by_page(toc)
+        toc_simplified = {entry["simplified"] for entries in toc_by_page.values() for entry in entries}
         pages = []
         for page in doc:
             number = page.number + 1
-            blocks = _page_blocks(page, body_size, repeated_margins, toc_by_page.get(number, []))
+            blocks = _page_blocks(
+                page, body_size, repeated_margins, toc_by_page.get(number, []), toc_simplified
+            )
             pages.append({"page": number, "blocks": blocks, "chunks": build_chunks(number, blocks)})
         metadata = doc.metadata or {}
         return {
@@ -94,9 +99,33 @@ def _document_profile(doc: pymupdf.Document) -> tuple[float, set[str]]:
                 if center < height * MARGIN_BAND or center > height * (1 - MARGIN_BAND):
                     margin_lines[_normalize_margin(text)] += 1
     body_size = sizes.most_common(1)[0][0] if sizes else 11.0
-    threshold = max(REPEAT_MIN_PAGES, int(doc.page_count * REPEAT_RATIO))
+    threshold = max(REPEAT_MIN_PAGES, round(doc.page_count * REPEAT_RATIO))
     repeated = {text for text, count in margin_lines.items() if count >= threshold}
     return body_size, repeated
+
+
+def _looks_like_running_header(text: str, toc_simplified: set[str]) -> bool:
+    if len(text) > 90:
+        return False
+    stripped = text.strip()
+    had_page_number = False
+    leading = LEADING_PAGE.match(stripped)
+    if leading is not None:
+        stripped = stripped[leading.end() :]
+        had_page_number = True
+    trailing = TRAILING_PAGE.search(stripped)
+    if trailing is not None:
+        stripped = stripped[: trailing.start()]
+        had_page_number = True
+    stripped = stripped.strip()
+    if not stripped:
+        return True
+    if had_page_number and not stripped.endswith((".", "!", "?")):
+        return True
+    simplified = _simplify(stripped)
+    if not simplified:
+        return True
+    return any(simplified in title or title in simplified for title in toc_simplified)
 
 
 def _heading_level(line: dict[str, Any], body_size: float, toc_titles: list[dict[str, Any]]) -> int | None:
@@ -212,6 +241,7 @@ def _page_blocks(
     body_size: float,
     repeated_margins: set[str],
     toc_titles: list[dict[str, Any]],
+    toc_simplified: set[str],
 ) -> list[dict[str, Any]]:
     width = page.rect.width or 1
     height = page.rect.height or 1
@@ -226,17 +256,23 @@ def _page_blocks(
             text = _line_text(line)
             if not text:
                 continue
-            center = (line["bbox"][1] + line["bbox"][3]) / 2
-            in_margin = center < height * MARGIN_BAND or center > height * (1 - MARGIN_BAND)
-            if in_margin and (
-                _normalize_margin(text) in repeated_margins or PAGE_LABEL.match(text)
-            ):
-                continue
             visible_spans = [span for span in line["spans"] if span["text"].strip()]
             size = max((span["size"] for span in visible_spans), default=body_size)
             bold = bool(visible_spans) and all(
                 span["flags"] & BOLD_FLAG for span in visible_spans
             )
+            center = (line["bbox"][1] + line["bbox"][3]) / 2
+            in_margin = center < height * MARGIN_BAND or center > height * (1 - MARGIN_BAND)
+            if (
+                in_margin
+                and size < body_size * 1.15
+                and (
+                    _normalize_margin(text) in repeated_margins
+                    or PAGE_LABEL.match(text)
+                    or _looks_like_running_header(text, toc_simplified)
+                )
+            ):
+                continue
             lines.append({"text": text, "size": size, "bold": bold, "bbox": line["bbox"]})
         if lines:
             blocks.extend(_classify(lines, body_size, toc_titles, width, height))

@@ -1,0 +1,734 @@
+{
+  "info": {
+    "name": "Bookly API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "ccBookId", "value": "" },
+    { "key": "artBookId", "value": "" },
+    { "key": "uploadedBookId", "value": "" },
+    { "key": "sessionId", "value": "" },
+    { "key": "chunkId", "value": "" },
+    { "key": "runEmail", "value": "" }
+  ],
+  "item": [
+    {
+      "name": "01 Health check",
+      "request": { "method": "GET", "url": "{{host}}/healthz" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('healthz returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('status is ok', () => pm.expect(pm.response.json().status).to.eql('ok'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "02 Me without auth is rejected",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/users/me" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('unauthenticated request returns 401', () => pm.response.to.have.status(401));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "03 Register a fresh account",
+      "request": {
+        "method": "POST",
+        "url": "{{host}}/api/v1/auth/register",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\": \"run{{$timestamp}}@bookly-tests.com\", \"password\": \"password123\", \"name\": \"Run User\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('register returns 201', () => pm.response.to.have.status(201));",
+              "const body = pm.response.json();",
+              "pm.test('register returns the user and tokens', () => {",
+              "  pm.expect(body.user.email).to.include('@bookly-tests.com');",
+              "  pm.expect(body.access_token).to.be.a('string').and.not.empty;",
+              "  pm.expect(body.refresh_token).to.be.a('string').and.not.empty;",
+              "});",
+              "pm.test('auth cookies are set', () => {",
+              "  pm.expect(pm.cookies.has('access_token')).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "04 Logout fresh account",
+      "request": { "method": "POST", "url": "{{host}}/api/v1/auth/logout" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('logout returns 204', () => pm.response.to.have.status(204));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "05 Login with seeded user",
+      "request": {
+        "method": "POST",
+        "url": "{{host}}/api/v1/auth/login",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\": \"{{email}}\", \"password\": \"{{password}}\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('login returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('login returns the seeded user', () => pm.expect(pm.response.json().user.email).to.eql(pm.environment.get('email')));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "06 Refresh session",
+      "request": { "method": "POST", "url": "{{host}}/api/v1/auth/refresh" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('refresh returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('refresh rotates tokens', () => pm.expect(pm.response.json().access_token).to.be.a('string').and.not.empty);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "07 Login with wrong password is rejected",
+      "request": {
+        "method": "POST",
+        "url": "{{host}}/api/v1/auth/login",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"email\": \"{{email}}\", \"password\": \"definitely-wrong\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('wrong password returns 401', () => pm.response.to.have.status(401));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "08 Get my profile",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/users/me" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('me returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('me matches the seeded user', () => pm.expect(pm.response.json().email).to.eql(pm.environment.get('email')));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "09 Update my name",
+      "request": {
+        "method": "PATCH",
+        "url": "{{host}}/api/v1/users/me",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"name\": \"Shashidhar Kundur\"}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('name update returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('name was updated', () => pm.expect(pm.response.json().name).to.eql('Shashidhar Kundur'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "10 Password change with wrong current password",
+      "request": {
+        "method": "PUT",
+        "url": "{{host}}/api/v1/users/me/password",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"current_password\": \"not-my-password\", \"new_password\": \"whatever123\"}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('wrong current password returns 400', () => pm.response.to.have.status(400));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "11 Get my stats",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/users/me/stats" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('stats returns 200', () => pm.response.to.have.status(200));",
+              "const stats = pm.response.json();",
+              "pm.test('stats includes the library', () => pm.expect(stats.total_books).to.be.at.least(2));",
+              "pm.test('stats has the expected shape', () => {",
+              "  pm.expect(stats).to.have.keys('total_books', 'by_status', 'favorites', 'pages_read', 'reading_seconds', 'recent_sessions');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "12 List books",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('list returns 200', () => pm.response.to.have.status(200));",
+              "const books = pm.response.json();",
+              "pm.test('both seeded books are present and processed', () => {",
+              "  const cc = books.find(b => b.title.toLowerCase().includes('code complete') && b.extraction_status === 'ready');",
+              "  const art = books.find(b => b.title.toLowerCase().includes('bots') && b.extraction_status === 'ready');",
+              "  pm.expect(cc, 'Code Complete present').to.exist;",
+              "  pm.expect(art, 'article present').to.exist;",
+              "  pm.expect(cc.extraction_status).to.eql('ready');",
+              "  pm.expect(art.extraction_status).to.eql('ready');",
+              "  pm.collectionVariables.set('ccBookId', cc.id);",
+              "  pm.collectionVariables.set('artBookId', art.id);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "13 Upload a PDF",
+      "request": {
+        "method": "POST",
+        "url": "{{host}}/api/v1/books",
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": "/Users/shashi/Documents/turnix/study/How Websites Detect Bots in 2026 — krowdev.pdf"
+            },
+            { "key": "title", "type": "text", "value": "Upload Smoke Test" }
+          ]
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('upload returns 201', () => pm.response.to.have.status(201));",
+              "const book = pm.response.json();",
+              "pm.test('uploaded book starts processing', () => {",
+              "  pm.expect(book.title).to.eql('Upload Smoke Test');",
+              "  pm.expect(['pending', 'processing']).to.include(book.extraction_status);",
+              "});",
+              "pm.collectionVariables.set('uploadedBookId', book.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "14 Get one book",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books/{{ccBookId}}" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('get returns 200', () => pm.response.to.have.status(200));",
+              "const book = pm.response.json();",
+              "pm.test('book is fully processed', () => {",
+              "  pm.expect(book.page_count).to.eql(952);",
+              "  pm.expect(book.has_cover).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "15 Organize a book",
+      "request": {
+        "method": "PATCH",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"status\": \"reading\", \"priority\": \"high\", \"color\": \"#e0a458\", \"is_favorite\": true}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('patch returns 200', () => pm.response.to.have.status(200));",
+              "const book = pm.response.json();",
+              "pm.test('organization fields stick', () => {",
+              "  pm.expect(book.status).to.eql('reading');",
+              "  pm.expect(book.priority).to.eql('high');",
+              "  pm.expect(book.color).to.eql('#e0a458');",
+              "  pm.expect(book.is_favorite).to.be.true;",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "16 Invalid color is rejected",
+      "request": {
+        "method": "PATCH",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"color\": \"red\"}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('invalid color returns 422', () => pm.response.to.have.status(422));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "17 Filter favorites",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books?favorite=true" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('filter returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('favorites filter finds the book', () => {",
+              "  const ids = pm.response.json().map(b => b.id);",
+              "  pm.expect(ids).to.include(pm.collectionVariables.get('ccBookId'));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "18 Search by title",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books?q=code complete" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('search returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('search finds Code Complete', () => {",
+              "  const ids = pm.response.json().map(b => b.id);",
+              "  pm.expect(ids).to.include(pm.collectionVariables.get('ccBookId'));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "19 Reorder shelf",
+      "request": {
+        "method": "PUT",
+        "url": "{{host}}/api/v1/books/reorder",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"book_ids\": [\"{{artBookId}}\", \"{{ccBookId}}\"]}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('reorder returns 204', () => pm.response.to.have.status(204));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "20 Order persists",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books?sort=position&order=asc" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('list returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('article now sits first', () => {",
+              "  const ids = pm.response.json().map(b => b.id);",
+              "  const art = pm.collectionVariables.get('artBookId');",
+              "  const cc = pm.collectionVariables.get('ccBookId');",
+              "  pm.expect(ids.indexOf(art)).to.be.below(ids.indexOf(cc));",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "21 Get cover image",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books/{{ccBookId}}/cover" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('cover returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('cover is a jpeg', () => pm.expect(pm.response.headers.get('Content-Type')).to.include('image/jpeg'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "22 Stream PDF with range request",
+      "request": {
+        "method": "GET",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/file",
+        "header": [{ "key": "Range", "value": "bytes=0-1023" }]
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('range request returns 206', () => pm.response.to.have.status(206));",
+              "pm.test('content-range header present', () => pm.expect(pm.response.headers.get('Content-Range')).to.include('bytes 0-1023/'));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "23 Update reading progress",
+      "request": {
+        "method": "PUT",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/progress",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"current_page\": 45, \"mark_read\": [40, 41, 42, 43, 44, 45]}"
+        }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('progress update returns 200', () => pm.response.to.have.status(200));",
+              "const progress = pm.response.json();",
+              "pm.test('progress reflects the read pages', () => {",
+              "  pm.expect(progress.current_page).to.eql(45);",
+              "  pm.expect(progress.pages_read).to.include(45);",
+              "  pm.expect(progress.percent).to.be.above(0);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "24 Read progress back",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books/{{ccBookId}}/progress" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('progress returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('progress persisted', () => pm.expect(pm.response.json().current_page).to.eql(45));"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "25 Start a reading session",
+      "request": {
+        "method": "POST",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/sessions",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"start_page\": 45}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('session start returns 201', () => pm.response.to.have.status(201));",
+              "const session = pm.response.json();",
+              "pm.test('session is open', () => pm.expect(session.ended_at).to.be.null);",
+              "pm.collectionVariables.set('sessionId', session.id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "26 Heartbeat the session",
+      "request": {
+        "method": "PATCH",
+        "url": "{{host}}/api/v1/sessions/{{sessionId}}",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "body": { "mode": "raw", "raw": "{\"end_page\": 46}" }
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('session update returns 200', () => pm.response.to.have.status(200));",
+              "const session = pm.response.json();",
+              "pm.test('session recorded the heartbeat', () => {",
+              "  pm.expect(session.ended_at).to.not.be.null;",
+              "  pm.expect(session.end_page).to.eql(46);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "27 List narration voices",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/voices" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('voices returns 200', () => pm.response.to.have.status(200));",
+              "const voices = pm.response.json();",
+              "pm.test('a healthy voice roster exists', () => {",
+              "  pm.expect(voices.length).to.be.at.least(4);",
+              "  pm.expect(voices.map(v => v.id)).to.include('af_heart');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "28 Get book content overview",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books/{{ccBookId}}/content" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('content returns 200', () => pm.response.to.have.status(200));",
+              "const content = pm.response.json();",
+              "pm.test('table of contents extracted', () => {",
+              "  pm.expect(content.page_count).to.eql(952);",
+              "  pm.expect(content.toc.length).to.be.above(100);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "29 Get page content",
+      "request": { "method": "GET", "url": "{{host}}/api/v1/books/{{ccBookId}}/pages/45" },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('page returns 200', () => pm.response.to.have.status(200));",
+              "const page = pm.response.json();",
+              "pm.test('page has blocks and narration chunks', () => {",
+              "  pm.expect(page.blocks.length).to.be.above(0);",
+              "  pm.expect(page.chunks.length).to.be.above(0);",
+              "  pm.expect(page.chunks[0]).to.have.keys('id', 'page', 'blocks', 'text', 'speech');",
+              "});",
+              "pm.collectionVariables.set('chunkId', page.chunks[0].id);"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "30 Synthesize narration timing",
+      "request": {
+        "method": "GET",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/audio/{{chunkId}}/timing?voice=af_heart"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('timing returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('word timestamps are present', () => {",
+              "  const words = pm.response.json().words;",
+              "  pm.expect(words.length).to.be.above(0);",
+              "  pm.expect(words[0]).to.have.keys('word', 'start', 'end');",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "31 Fetch narration audio",
+      "request": {
+        "method": "GET",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/audio/{{chunkId}}?voice=af_heart"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('audio returns 200', () => pm.response.to.have.status(200));",
+              "pm.test('audio is wav and non-trivial', () => {",
+              "  pm.expect(pm.response.headers.get('Content-Type')).to.include('audio/wav');",
+              "  pm.expect(pm.response.stream.length).to.be.above(5000);",
+              "});"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "32 Unknown chunk returns 404",
+      "request": {
+        "method": "GET",
+        "url": "{{host}}/api/v1/books/{{ccBookId}}/audio/9999-99?voice=af_heart"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('bogus chunk returns 404', () => pm.response.to.have.status(404));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "33 Unknown book returns 404",
+      "request": {
+        "method": "GET",
+        "url": "{{host}}/api/v1/books/00000000-0000-0000-0000-000000000000"
+      },
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('unknown book returns 404', () => pm.response.to.have.status(404));"]
+          }
+        }
+      ]
+    },
+    {
+      "name": "34 Delete the uploaded smoke-test book",
+      "request": { "method": "DELETE", "url": "{{host}}/api/v1/books/{{uploadedBookId}}" },
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "if (!pm.collectionVariables.get('uploadedBookId')) {",
+              "  pm.execution.skipRequest();",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": ["pm.test('cleanup delete returns 204', () => pm.response.to.have.status(204));"]
+          }
+        }
+      ]
+    }
+  ]
+}

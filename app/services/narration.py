@@ -3,11 +3,11 @@ import re
 MAX_CHUNK_CHARS = 420
 
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
-DOT_LEADER_PAGE = re.compile(r"\s*\.{4,}\s*([0-9]+|[ivxlcdmIVXLCDM]+)\b")
-DOT_LEADER = re.compile(r"\s*\.{4,}\s*")
+DOT_LEADER_PAGE = re.compile(r"(?:\s*\.){4,}\s*([0-9]+|[ivxlcdmIVXLCDM]+)\b")
+DOT_LEADER = re.compile(r"(?:\s*\.){4,}\s*")
 URL = re.compile(r"https?://(?:www\.)?([^\s/]+)\S*")
 WHITESPACE = re.compile(r"\s+")
-LIST_MARKER = re.compile(r"^\s*(?:(\d{1,3})[.)]|([a-zA-Z])[.)]|[•▪◦‣·∙○●♦►▶*–—-])\s+")
+LIST_MARKER = re.compile(r"^\s*(?:(\d{1,3})[.)]|([a-zA-Z])[.)]|[•▪■□◦‣·∙○●♦►▶*–—-])\s+")
 NUMBERED_TITLE = re.compile(r"^(\d{1,3})\s+(.{3,})$")
 TITLE_KEYWORD = re.compile(r"(?i)^(chapter|part|section|appendix|unit|lesson)\b")
 
@@ -74,53 +74,57 @@ def _split_long_sentence(sentence: str) -> list[str]:
 
 def build_chunks(page: int, blocks: list[dict]) -> list[dict]:
     chunks: list[dict] = []
-    pending_items: list[tuple[str, str, int]] = []
+    buffer: list[tuple[str, str, int]] = []
+    buffer_length = 0
 
-    def add(text: str, speech: str, block_ids: list[int]) -> None:
-        speech = speech.strip()
-        if not speech:
-            return
+    def append_chunk(text: str, speech: str, block_ids: list[int]) -> None:
         chunks.append(
             {
                 "id": f"{page}-{len(chunks)}",
                 "page": page,
                 "blocks": block_ids,
-                "text": text.strip(),
+                "text": text,
                 "speech": speech,
             }
         )
 
-    def flush_items() -> None:
-        nonlocal pending_items
-        group: list[tuple[str, str, int]] = []
-        length = 0
-        for display, speech, block_id in pending_items:
-            if group and length + len(speech) > MAX_CHUNK_CHARS:
-                _emit(group)
-                group, length = [], 0
-            group.append((display, speech, block_id))
-            length += len(speech)
-        if group:
-            _emit(group)
-        pending_items = []
+    def emit() -> None:
+        nonlocal buffer, buffer_length
+        if not buffer:
+            return
+        displays: list[str] = []
+        block_ids: list[int] = []
+        for display, _, block_id in buffer:
+            if block_ids and block_id == block_ids[-1]:
+                displays[-1] = f"{displays[-1]} {display}"
+            else:
+                displays.append(display)
+                block_ids.append(block_id)
+        append_chunk("\n".join(displays), " ".join(unit[1] for unit in buffer), block_ids)
+        buffer = []
+        buffer_length = 0
 
-    def _emit(group: list[tuple[str, str, int]]) -> None:
-        add(
-            "\n".join(item[0] for item in group),
-            " ".join(item[1] for item in group),
-            [item[2] for item in group],
-        )
+    def push(display: str, speech: str, block_id: int) -> None:
+        nonlocal buffer_length
+        speech = speech.strip()
+        if not speech:
+            return
+        if buffer and buffer_length + len(speech) > MAX_CHUNK_CHARS:
+            emit()
+        buffer.append((display.strip(), speech, block_id))
+        buffer_length += len(speech)
 
     for block in blocks:
         index = block["i"]
         if block["type"] == "heading":
-            flush_items()
-            add(block["text"], heading_speech(block), [index])
+            emit()
+            speech = heading_speech(block)
+            if speech:
+                append_chunk(block["text"].strip(), speech, [index])
         elif block["type"] == "list_item":
-            pending_items.append((block["text"], item_speech(block["text"]), index))
+            push(block["text"], item_speech(block["text"]), index)
         else:
-            flush_items()
             for piece in split_text(clean_for_speech(block["text"])):
-                add(piece, piece, [index])
-    flush_items()
+                push(piece, piece, index)
+    emit()
     return chunks

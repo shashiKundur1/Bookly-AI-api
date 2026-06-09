@@ -7,8 +7,9 @@ from fastapi.responses import FileResponse
 
 from app.config import get_settings
 from app.dependencies import OwnedBook
+from app.services import ai
 from app.services.content import chunks_after, find_chunk, load_content
-from app.services.tts import VOICE_IDS, VOICES, ensure_audio, prefetch, timing_path
+from app.services.tts import VOICE_IDS, VOICES, audio_path, ensure_audio, prefetch, timing_path
 
 router = APIRouter(tags=["narration"])
 
@@ -56,6 +57,10 @@ async def _resolve_audio(book: OwnedBook, chunk_id: str, voice: str | None):
     chunk = find_chunk(content, chunk_id)
     if chunk is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Chunk not found")
+    if ai.is_enabled() and not audio_path(book.id, resolved_voice, chunk_id).exists():
+        await ai.ensure_page_polished(book.id, chunk["page"])
+        content = await load_content(book.id)
+        chunk = find_chunk(content, chunk_id) or chunk
     path = await ensure_audio(book.id, resolved_voice, chunk)
     prefetch(book.id, resolved_voice, chunks_after(content, chunk_id, PREFETCH_COUNT))
     return path

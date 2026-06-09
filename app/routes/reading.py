@@ -45,6 +45,7 @@ async def update_progress(payload: ProgressUpdate, book: OwnedBook, session: Ses
     if book.page_count and len(read) >= book.page_count:
         book.status = "finished"
     await session.commit()
+    await session.refresh(progress)
     return ProgressOut.from_model(progress, book.page_count)
 
 
