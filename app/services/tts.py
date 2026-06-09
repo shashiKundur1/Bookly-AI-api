@@ -212,7 +212,7 @@ class EdgeSpeechEngine(SpeechEngine):
         import edge_tts
 
         rate = f"{round((speed - 1) * 100):+d}%"
-        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        communicate = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
         mp3 = bytearray()
         words: list[dict[str, Any]] = []
         async for event in communicate.stream():
