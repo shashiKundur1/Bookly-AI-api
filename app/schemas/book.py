@@ -33,10 +33,10 @@ class BookOut(BaseModel):
     progress: ProgressOut | None
 
     @classmethod
-    def from_model(cls, book: Book) -> "BookOut":
+    def from_model(cls, book: Book, include_pages: bool = True) -> "BookOut":
         progress = None
         if book.progress is not None:
-            progress = ProgressOut.from_model(book.progress, book.page_count)
+            progress = ProgressOut.from_model(book.progress, book.page_count, include_pages)
         return cls(
             id=book.id,
             title=book.title,

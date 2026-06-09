@@ -57,7 +57,7 @@ async def list_books(
     column = SORT_COLUMNS[sort]
     direction = column.desc().nulls_last() if order == "desc" else column.asc().nulls_last()
     books = (await session.scalars(query.order_by(direction, Book.position))).all()
-    return [BookOut.from_model(book) for book in books]
+    return [BookOut.from_model(book, include_pages=False) for book in books]
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)

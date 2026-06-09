@@ -13,12 +13,14 @@ class ProgressOut(BaseModel):
     updated_at: datetime | None
 
     @classmethod
-    def from_model(cls, progress: ReadingProgress, page_count: int) -> "ProgressOut":
+    def from_model(
+        cls, progress: ReadingProgress, page_count: int, include_pages: bool = True
+    ) -> "ProgressOut":
         read = sorted(set(progress.pages_read or []))
         percent = round(len(read) / page_count * 100, 1) if page_count else 0.0
         return cls(
             current_page=progress.current_page,
-            pages_read=read,
+            pages_read=read if include_pages else [],
             percent=min(percent, 100.0),
             updated_at=progress.updated_at,
         )
