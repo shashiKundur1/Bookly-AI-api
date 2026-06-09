@@ -209,6 +209,18 @@ async def _narration_receiver(
         session.signal()
 
 
+def _cache_is_stale(path) -> bool:
+    if not engine.has_word_timings:
+        return False
+    timing = timing_path(path)
+    if not timing.exists():
+        return True
+    try:
+        return len(json.loads(timing.read_text()).get("words", [])) == 0
+    except (json.JSONDecodeError, OSError):
+        return True
+
+
 async def _send_pcm(websocket: WebSocket, pcm: bytes) -> None:
     for index in range(0, len(pcm), PCM_FRAME_BYTES):
         await websocket.send_bytes(pcm[index : index + PCM_FRAME_BYTES])
@@ -245,7 +257,7 @@ async def _stream_chunk(
     voice = session.voice
     speed = session.speed
     cache = audio_path(book_id, voice, chunk["id"])
-    cached = speed == 1.0 and cache.exists()
+    cached = speed == 1.0 and cache.exists() and not _cache_is_stale(cache)
     await websocket.send_json(
         {
             "type": "chunk",

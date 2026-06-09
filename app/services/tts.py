@@ -106,6 +106,7 @@ def pcm16_bytes(samples: np.ndarray) -> bytes:
 
 class SpeechEngine:
     voices: list[dict[str, str]] = KOKORO_VOICES
+    has_word_timings = False
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -142,6 +143,8 @@ class SpeechEngine:
 
 
 class TorchSpeechEngine(SpeechEngine):
+    has_word_timings = True
+
     def __init__(self) -> None:
         super().__init__()
         self._pipelines: dict[str, Any] = {}
@@ -200,6 +203,7 @@ class OnnxSpeechEngine(SpeechEngine):
 
 class EdgeSpeechEngine(SpeechEngine):
     voices = EDGE_VOICES
+    has_word_timings = True
 
     def _synthesize_samples(
         self, text: str, voice: str, speed: float
