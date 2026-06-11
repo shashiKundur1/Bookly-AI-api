@@ -1,21 +1,21 @@
 import asyncio
 import json
+import logging
 import uuid
-from typing import Annotated, Any
+from typing import Any
 
 import anyio
 import numpy as np
 from fastapi import (
     APIRouter,
     HTTPException,
-    Query,
     Request,
     Response,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 from app.config import get_settings
 from app.database import SessionFactory
@@ -26,38 +26,45 @@ from app.services import ai
 from app.services.cache import is_fresh, weak_etag
 from app.services.content import (
     adjacent_chunk,
-    chunks_after,
     find_chunk,
     first_chunk_at_or_after,
     load_content,
 )
+from app.services.emotion import DEFAULT_EMOTION, EMOTIONS, plan, resolve_emotion
 from app.services.tts import (
     SAMPLE_RATE,
     VOICE_IDS,
     VOICES,
     audio_path,
     engine,
-    ensure_audio,
     pcm16_bytes,
-    prefetch,
     resolve_voice,
     split_for_streaming,
     timing_path,
     write_chunk_cache,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["narration"])
 
-PREFETCH_COUNT = 2
 PCM_FRAME_BYTES = 64 * 1024
 CONTENT_CACHE_CONTROL = "private, max-age=300"
-AUDIO_CACHE_CONTROL = "private, max-age=604800"
+ESTIMATED_CHARS_PER_SECOND = 13.5
+
+_polish_tasks: set[asyncio.Task] = set()
 
 
 @router.get("/voices")
 async def list_voices(response: Response) -> list[dict[str, str]]:
     response.headers["Cache-Control"] = "public, max-age=86400"
     return VOICES
+
+
+@router.get("/emotions")
+async def list_emotions(response: Response) -> list[dict[str, str]]:
+    response.headers["Cache-Control"] = "public, max-age=86400"
+    return EMOTIONS
 
 
 @router.get("/books/{book_id}/content")
@@ -97,37 +104,11 @@ async def get_page_content(page_number: int, book: OwnedBook, request: Request) 
     )
 
 
-async def _resolve_audio(book: OwnedBook, chunk_id: str, voice: str | None):
-    resolved_voice = resolve_voice(voice)
-    content = await load_content(book.id)
-    if content is None:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Book content is still processing")
-    chunk = find_chunk(content, chunk_id)
-    if chunk is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Chunk not found")
-    if ai.is_enabled() and not audio_path(book.id, resolved_voice, chunk_id).exists():
-        await ai.ensure_page_polished(book.id, chunk["page"])
-        content = await load_content(book.id)
-        chunk = find_chunk(content, chunk_id) or chunk
-    path = await ensure_audio(book.id, resolved_voice, chunk)
-    prefetch(book.id, resolved_voice, chunks_after(content, chunk_id, PREFETCH_COUNT))
-    return path
-
-
-@router.get("/books/{book_id}/audio/{chunk_id}")
-async def get_chunk_audio(
-    chunk_id: str,
-    book: OwnedBook,
-    voice: Annotated[str | None, Query()] = None,
-) -> FileResponse:
-    path = await _resolve_audio(book, chunk_id, voice)
-    return FileResponse(path, media_type="audio/wav", headers={"Cache-Control": AUDIO_CACHE_CONTROL})
-
-
 class NarrationSession:
-    def __init__(self, voice: str, speed: float) -> None:
+    def __init__(self, voice: str, speed: float, emotion: str) -> None:
         self.voice = voice
         self.speed = speed
+        self.emotion = emotion
         self.current: str | None = None
         self.pending: str | None = None
         self.flush = False
@@ -176,6 +157,8 @@ async def _narration_receiver(
                 if voice in VOICE_IDS:
                     session.voice = voice
                 session.speed = _clamp_speed(message.get("speed", session.speed))
+                if isinstance(message.get("emotion"), str):
+                    session.emotion = resolve_emotion(message["emotion"])
                 target = _resolve_start(content, message)
                 if target is not None:
                     session.pending = target
@@ -185,10 +168,16 @@ async def _narration_receiver(
             elif kind == "seek":
                 chunk_id = message.get("chunk")
                 direction = message.get("direction")
-                base = chunk_id if isinstance(chunk_id, str) else session.pending or session.current
-                chunk = find_chunk(content, base) if base else None
-                if chunk is not None and direction in (1, -1):
-                    chunk = adjacent_chunk(content, chunk["id"], direction) or chunk
+                page = message.get("page")
+                if isinstance(page, int) and not isinstance(chunk_id, str):
+                    chunk = first_chunk_at_or_after(content, page)
+                else:
+                    base = (
+                        chunk_id if isinstance(chunk_id, str) else session.pending or session.current
+                    )
+                    chunk = find_chunk(content, base) if base else None
+                    if chunk is not None and direction in (1, -1):
+                        chunk = adjacent_chunk(content, chunk["id"], direction) or chunk
                 if chunk is not None:
                     session.pending = chunk["id"]
                     session.flush = True
@@ -196,6 +185,9 @@ async def _narration_receiver(
                 voice = message.get("voice")
                 if voice in VOICE_IDS:
                     session.voice = voice
+            elif kind == "emotion":
+                if isinstance(message.get("emotion"), str):
+                    session.emotion = resolve_emotion(message["emotion"])
             elif kind == "speed":
                 session.speed = _clamp_speed(message.get("speed"))
             elif kind == "stop":
@@ -204,6 +196,20 @@ async def _narration_receiver(
     except (WebSocketDisconnect, RuntimeError, json.JSONDecodeError, KeyError):
         session.stopped = True
         session.signal()
+
+
+def _kick_polish(book_id: uuid.UUID, page: int) -> None:
+    if not ai.is_enabled():
+        return
+    task = asyncio.create_task(ai.ensure_page_polished(book_id, page))
+    _polish_tasks.add(task)
+    task.add_done_callback(_polish_done)
+
+
+def _polish_done(task: asyncio.Task) -> None:
+    _polish_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Background polish failed: %s", task.exception())
 
 
 def _cache_is_stale(path) -> bool:
@@ -218,30 +224,54 @@ def _cache_is_stale(path) -> bool:
         return True
 
 
+def _pad_silence(samples: np.ndarray, rate: int, pre: float, post: float) -> np.ndarray:
+    if pre <= 0 and post <= 0:
+        return samples
+    return np.concatenate(
+        [
+            np.zeros(int(pre * rate), dtype=np.float32),
+            samples,
+            np.zeros(int(post * rate), dtype=np.float32),
+        ]
+    )
+
+
 async def _send_pcm(websocket: WebSocket, pcm: bytes) -> None:
     for index in range(0, len(pcm), PCM_FRAME_BYTES):
         await websocket.send_bytes(pcm[index : index + PCM_FRAME_BYTES])
 
 
-async def _stream_cached(websocket: WebSocket, chunk: dict[str, Any], path) -> None:
+async def _stream_cached(websocket: WebSocket, chunk: dict[str, Any], speech: str, path) -> None:
     data = await anyio.to_thread.run_sync(path.read_bytes)
     pcm = data[44:]
-    words: list[dict[str, Any]] = []
+    timing_data: dict[str, Any] = {}
     timing = timing_path(path)
     if timing.exists():
         try:
-            words = json.loads(timing.read_text()).get("words", [])
+            timing_data = json.loads(timing.read_text())
         except (json.JSONDecodeError, OSError):
-            words = []
-    await websocket.send_json(
-        {
-            "type": "sentence",
-            "chunk_id": chunk["id"],
-            "text": chunk["speech"],
-            "offset": 0.0,
-            "words": words,
-        }
-    )
+            timing_data = {}
+    sentences = timing_data.get("sentences")
+    if not sentences:
+        sentences = [
+            {
+                "text": speech,
+                "offset": 0.0,
+                "words": timing_data.get("words", []),
+                "cues": {"lead": "", "trail": ""},
+            }
+        ]
+    for frame in sentences:
+        await websocket.send_json(
+            {
+                "type": "sentence",
+                "chunk_id": chunk["id"],
+                "text": frame.get("text", ""),
+                "offset": frame.get("offset", 0.0),
+                "words": frame.get("words", []),
+                "cues": frame.get("cues", {"lead": "", "trail": ""}),
+            }
+        )
     await _send_pcm(websocket, pcm)
 
 
@@ -252,8 +282,10 @@ async def _stream_chunk(
     chunk: dict[str, Any],
 ) -> None:
     voice = session.voice
+    emotion = session.emotion
     speed = session.speed
-    cache = audio_path(book_id, voice, chunk["id"])
+    speech = chunk["speech"]
+    cache = audio_path(book_id, voice, emotion, chunk["id"], speech)
     cached = speed == 1.0 and cache.exists() and not _cache_is_stale(cache)
     await websocket.send_json(
         {
@@ -261,13 +293,13 @@ async def _stream_chunk(
             "id": chunk["id"],
             "page": chunk["page"],
             "blocks": chunk["blocks"],
-            "speech": chunk["speech"],
+            "speech": speech,
             "sample_rate": SAMPLE_RATE,
             "cached": cached,
         }
     )
     if cached:
-        await _stream_cached(websocket, chunk, cache)
+        await _stream_cached(websocket, chunk, speech, cache)
         duration = (cache.stat().st_size - 44) / 2 / SAMPLE_RATE
         await websocket.send_json(
             {"type": "chunk_end", "id": chunk["id"], "duration": round(duration, 3)}
@@ -276,33 +308,104 @@ async def _stream_chunk(
     offset = 0.0
     parts: list[np.ndarray] = []
     collected: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
     rate = SAMPLE_RATE
     complete = True
-    for piece in split_for_streaming(chunk["speech"]):
+    pieces = split_for_streaming(speech)
+    for index, piece in enumerate(pieces):
         if session.flush or session.stopped:
             complete = False
             break
-        samples, rate, words = await engine.synthesize_sentence(piece, session.voice, session.speed)
-        shifted = [
-            {**word, "start": round(word["start"] + offset, 3), "end": round(word["end"] + offset, 3)}
-            for word in words
-        ]
-        await websocket.send_json(
-            {
-                "type": "sentence",
-                "chunk_id": chunk["id"],
+        prosody = await asyncio.to_thread(
+            lambda p=piece, i=index: plan(
+                p,
+                emotion,
+                first=i == 0,
+                last=i == len(pieces) - 1,
+                next_chars=len(pieces[i + 1]) if i + 1 < len(pieces) else None,
+            )
+        )
+        pre = prosody.pre_pause / session.speed
+        post = prosody.post_pause / session.speed
+        cues = {
+            "lead": prosody.lead_tag if engine.performs(prosody.lead_tag) else "",
+            "trail": prosody.trail_tag if engine.performs(prosody.trail_tag) else "",
+        }
+
+        def shift(words: list[dict[str, Any]], base: float) -> list[dict[str, Any]]:
+            return [
+                {
+                    **word,
+                    "start": round(word["start"] + base, 3),
+                    "end": round(word["end"] + base, 3),
+                }
+                for word in words
+            ]
+
+        if engine.streams_pcm and session.speed == 1.0:
+            # Streaming engines push PCM the moment frames decode, so playback
+            # starts in well under a second. The sentence frame goes out first
+            # with pace-estimated word timings; the exact timings follow in a
+            # sentence_update once the piece finishes.
+            estimated = engine._estimate_words(
+                piece, len(piece) / ESTIMATED_CHARS_PER_SECOND, prosody
+            )
+            frame = {
+                "text": piece,
+                "offset": round(offset, 3),
+                "words": shift(estimated, offset + pre),
+                "cues": cues,
+            }
+            await websocket.send_json({"type": "sentence", "chunk_id": chunk["id"], **frame})
+            if pre > 0:
+                await _send_pcm(websocket, pcm16_bytes(np.zeros(int(pre * rate), np.float32)))
+
+            async def forward(block: np.ndarray) -> None:
+                await _send_pcm(websocket, pcm16_bytes(block))
+
+            samples, rate, words = await engine.stream_sentence(
+                piece, session.voice, session.speed, prosody, forward
+            )
+            if post > 0:
+                await _send_pcm(websocket, pcm16_bytes(np.zeros(int(post * rate), np.float32)))
+            samples = _pad_silence(samples, rate, pre, post)
+            shifted = shift(words, offset + pre)
+            frame["words"] = shifted
+            await websocket.send_json(
+                {
+                    "type": "sentence_update",
+                    "chunk_id": chunk["id"],
+                    "offset": frame["offset"],
+                    "words": shifted,
+                }
+            )
+        else:
+            samples, rate, words = await engine.synthesize_sentence(
+                piece, session.voice, session.speed, prosody
+            )
+            samples = _pad_silence(samples, rate, pre, post)
+            shifted = shift(words, offset + pre)
+            frame = {
                 "text": piece,
                 "offset": round(offset, 3),
                 "words": shifted,
+                "cues": cues,
             }
-        )
-        await _send_pcm(websocket, pcm16_bytes(samples))
+            await websocket.send_json({"type": "sentence", "chunk_id": chunk["id"], **frame})
+            await _send_pcm(websocket, pcm16_bytes(samples))
         offset += len(samples) / rate
         parts.append(samples)
         collected.extend(shifted)
-    if complete and parts and session.speed == 1.0 and session.voice == voice:
+        frames.append(frame)
+    if (
+        complete
+        and parts
+        and session.speed == 1.0
+        and session.voice == voice
+        and session.emotion == emotion
+    ):
         combined = np.concatenate(parts)
-        await anyio.to_thread.run_sync(write_chunk_cache, cache, combined, rate, collected)
+        await anyio.to_thread.run_sync(write_chunk_cache, cache, combined, rate, collected, frames)
     if complete:
         await websocket.send_json(
             {"type": "chunk_end", "id": chunk["id"], "duration": round(offset, 3)}
@@ -331,8 +434,9 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
         await websocket.close(code=4409)
         return
     await websocket.accept()
-    session = NarrationSession(resolve_voice(None), 1.0)
+    session = NarrationSession(resolve_voice(None), 1.0, DEFAULT_EMOTION)
     receiver = asyncio.create_task(_narration_receiver(websocket, session, content))
+    polished_page = -1
     try:
         while not session.stopped:
             if session.pending is None:
@@ -345,6 +449,10 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
             if chunk is None:
                 await websocket.send_json({"type": "error", "message": "Chunk not found"})
                 continue
+            if chunk["page"] != polished_page:
+                polished_page = chunk["page"]
+                _kick_polish(book_id, polished_page)
+                _kick_polish(book_id, polished_page + 1)
             session.current = chunk["id"]
             await _stream_chunk(websocket, session, book_id, chunk)
             if session.stopped or session.pending is not None:
@@ -362,18 +470,3 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
         pass
     finally:
         receiver.cancel()
-
-
-@router.get("/books/{book_id}/audio/{chunk_id}/timing")
-async def get_chunk_timing(
-    chunk_id: str,
-    book: OwnedBook,
-    response: Response,
-    voice: Annotated[str | None, Query()] = None,
-) -> dict[str, Any]:
-    path = await _resolve_audio(book, chunk_id, voice)
-    response.headers["Cache-Control"] = AUDIO_CACHE_CONTROL
-    timing = timing_path(path)
-    if not timing.exists():
-        return {"words": []}
-    return await anyio.to_thread.run_sync(lambda: json.loads(timing.read_text()))

@@ -209,6 +209,7 @@ dependencies = [
     { name = "edge-tts" },
     { name = "fastapi" },
     { name = "numpy" },
+    { name = "onnxruntime" },
     { name = "pwdlib", extra = ["argon2"] },
     { name = "pydantic", extra = ["email"] },
     { name = "pydantic-settings" },
@@ -216,6 +217,7 @@ dependencies = [
     { name = "pymupdf" },
     { name = "python-multipart" },
     { name = "sqlalchemy", extra = ["asyncio"] },
+    { name = "tokenizers" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -243,6 +245,7 @@ requires-dist = [
     { name = "kokoro", marker = "extra == 'tts-torch'", specifier = ">=0.9.4" },
     { name = "kokoro-onnx", marker = "extra == 'tts-onnx'", specifier = ">=0.5" },
     { name = "numpy", specifier = ">=1.26" },
+    { name = "onnxruntime", specifier = ">=1.20" },
     { name = "pwdlib", extras = ["argon2"], specifier = ">=0.3" },
     { name = "pydantic", extras = ["email"], specifier = ">=2.13" },
     { name = "pydantic-settings", specifier = ">=2.14" },
@@ -250,6 +253,7 @@ requires-dist = [
     { name = "pymupdf", specifier = ">=1.27" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "sqlalchemy", extras = ["asyncio"], specifier = ">=2.0.50,<2.1" },
+    { name = "tokenizers", specifier = ">=0.20" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.49" },
 ]
 provides-extras = ["tts-torch", "tts-onnx"]

@@ -93,25 +93,3 @@ def first_chunk_at_or_after(content: dict[str, Any], page_number: int) -> dict[s
             return candidates[0]
         page += 1
     return None
-
-
-def chunks_after(content: dict[str, Any], chunk_id: str, count: int) -> list[dict[str, Any]]:
-    try:
-        page_number = int(chunk_id.split("-", 1)[0])
-    except ValueError:
-        return []
-    collected: list[dict[str, Any]] = []
-    passed_current = False
-    page = page_number
-    while len(collected) < count and page <= len(content["pages"]):
-        for chunk in _page_chunks(content, page):
-            if passed_current:
-                collected.append(chunk)
-                if len(collected) >= count:
-                    break
-            elif chunk["id"] == chunk_id:
-                passed_current = True
-        if not passed_current:
-            return []
-        page += 1
-    return collected

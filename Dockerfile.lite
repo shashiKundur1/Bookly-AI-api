@@ -22,7 +22,11 @@ RUN mkdir -p /app/models-seed \
     && curl -fL -o /app/models-seed/kokoro-v1.0.int8.onnx \
         https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx \
     && curl -fL -o /app/models-seed/voices-v1.0.bin \
-        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+        https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin \
+    && curl -fL -o /app/models-seed/go_emotions.quant.onnx \
+        https://huggingface.co/SamLowe/roberta-base-go_emotions-onnx/resolve/main/onnx/model_quantized.onnx \
+    && curl -fL -o /app/models-seed/go_emotions.tokenizer.json \
+        https://huggingface.co/SamLowe/roberta-base-go_emotions-onnx/resolve/main/onnx/tokenizer.json
 
 COPY alembic.ini entrypoint.sh ./
 COPY alembic ./alembic

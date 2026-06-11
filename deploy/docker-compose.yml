@@ -28,6 +28,7 @@ services:
       CORS_ORIGINS: '["https://${DOMAIN}"]'
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       TTS_ENGINE: ${TTS_ENGINE:-kokoro-onnx}
+      ORPHEUS_URL: ${ORPHEUS_URL:-http://localhost:8080}
     volumes:
       - bookly-data:/app/data
     depends_on:

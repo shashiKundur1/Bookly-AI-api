@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     default_voice: str = "af_heart"
     tts_engine: str = "kokoro"
     gemini_api_key: str = ""
+    orpheus_url: str = "http://localhost:8080"
 
     @property
     def books_dir(self) -> Path:

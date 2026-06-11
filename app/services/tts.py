@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -11,12 +12,13 @@ from typing import Any
 import numpy as np
 
 from app.config import get_settings
+from app.services.emotion import Prosody
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?;:])\s+")
-FIRST_PIECE_MAX_CHARS = 90
+FIRST_PIECE_MAX_CHARS = 60
 PIECE_MAX_CHARS = 220
 ONNX_MODEL_FILE = "kokoro-v1.0.int8.onnx"
 ONNX_VOICES_FILE = "voices-v1.0.bin"
@@ -38,6 +40,32 @@ EDGE_VOICES = [
     {"id": "en-GB-SoniaNeural", "name": "Sonia", "gender": "female", "accent": "british"},
     {"id": "en-GB-RyanNeural", "name": "Ryan", "gender": "male", "accent": "british"},
 ]
+
+ORPHEUS_VOICES = [
+    {"id": "tara", "name": "Tara", "gender": "female", "accent": "american"},
+    {"id": "leah", "name": "Leah", "gender": "female", "accent": "american"},
+    {"id": "jess", "name": "Jess", "gender": "female", "accent": "american"},
+    {"id": "leo", "name": "Leo", "gender": "male", "accent": "american"},
+    {"id": "dan", "name": "Dan", "gender": "male", "accent": "american"},
+    {"id": "mia", "name": "Mia", "gender": "female", "accent": "american"},
+    {"id": "zac", "name": "Zac", "gender": "male", "accent": "american"},
+    {"id": "zoe", "name": "Zoe", "gender": "female", "accent": "american"},
+]
+
+# Semantic acting cue -> Orpheus emotive tag. Orpheus performs these audibly
+# (actual laughter, gasps, breath); cues it cannot voice fall back to the
+# prosody/pause channel only. Sighs/exhales are deliberately absent: the only
+# breath-like sound a narrator makes between lines is an inhale.
+ORPHEUS_TAGS = {
+    "laugh": "<laugh>",
+    "chuckle": "<chuckle>",
+    "gasp": "<gasp>",
+    "groan": "<groan>",
+    "yawn": "<yawn>",
+    "sniffle": "<sniffle>",
+    "cry": "<sniffle>",
+    "cough": "<cough>",
+}
 
 
 def _wav_bytes(samples: np.ndarray, sample_rate: int) -> bytes:
@@ -104,42 +132,52 @@ def pcm16_bytes(samples: np.ndarray) -> bytes:
     return (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
 
 
+def _effective_speed(speed: float, prosody: Prosody | None) -> float:
+    if prosody is not None:
+        speed *= prosody.rate
+    return max(0.5, min(2.0, speed))
+
+
 class SpeechEngine:
     voices: list[dict[str, str]] = KOKORO_VOICES
     has_word_timings = False
+    streams_pcm = False
+
+    def performs(self, tag: str) -> bool:
+        """Whether the engine audibly acts out the given semantic cue."""
+        return False
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self.voice_ids = {voice["id"] for voice in self.voices}
 
     def _synthesize_samples(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
         raise NotImplementedError
 
-    def _synthesize(self, text: str, voice: str) -> tuple[bytes, list[dict[str, Any]]]:
-        samples, sample_rate, words = self._synthesize_samples(text, voice, 1.0)
-        return _wav_bytes(samples, sample_rate), words
-
     async def synthesize_sentence(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None = None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
         async with self._lock:
-            return await asyncio.to_thread(self._synthesize_samples, text, voice, speed)
+            return await asyncio.to_thread(self._synthesize_samples, text, voice, speed, prosody)
 
-    async def synthesize_to_file(self, text: str, voice: str, path: Path) -> Path:
-        if path.exists():
-            return path
-        async with self._lock:
-            if path.exists():
-                return path
-            audio, words = await asyncio.to_thread(self._synthesize, text, voice)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temp = path.with_name(f"{path.name}.tmp")
-            temp.write_bytes(audio)
-            temp.rename(path)
-            timing_path(path).write_text(json.dumps({"words": words}, ensure_ascii=False))
-            return path
+    async def stream_sentence(
+        self,
+        text: str,
+        voice: str,
+        speed: float,
+        prosody: Prosody | None,
+        on_pcm,
+    ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
+        """Synthesize while pushing PCM to ``on_pcm`` as audio becomes available.
+
+        The base implementation synthesizes fully and emits once; streaming
+        engines override this to emit audio with sub-second latency.
+        """
+        samples, rate, words = await self.synthesize_sentence(text, voice, speed, prosody)
+        await on_pcm(samples)
+        return samples, rate, words
 
 
 class TorchSpeechEngine(SpeechEngine):
@@ -161,13 +199,13 @@ class TorchSpeechEngine(SpeechEngine):
         return pipeline
 
     def _synthesize_samples(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
         pipeline = self._pipeline("b" if voice.startswith("b") else "a")
         segments: list[np.ndarray] = []
         words: list[dict[str, Any]] = []
         offset = 0.0
-        for result in pipeline(text, voice=voice, speed=speed):
+        for result in pipeline(text, voice=voice, speed=_effective_speed(speed, prosody)):
             audio = result.audio.numpy()
             words.extend(_words_from_tokens(result.tokens or [], offset))
             offset += len(audio) / SAMPLE_RATE
@@ -193,11 +231,13 @@ class OnnxSpeechEngine(SpeechEngine):
         return self._kokoro
 
     def _synthesize_samples(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
         kokoro = self._load()
         lang = "en-gb" if voice.startswith("b") else "en-us"
-        samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
+        samples, sample_rate = kokoro.create(
+            text, voice=voice, speed=_effective_speed(speed, prosody), lang=lang
+        )
         return np.asarray(samples, dtype=np.float32), sample_rate, []
 
 
@@ -206,17 +246,24 @@ class EdgeSpeechEngine(SpeechEngine):
     has_word_timings = True
 
     def _synthesize_samples(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
-        return asyncio.run(self._collect(text, voice, speed))
+        return asyncio.run(self._collect(text, voice, speed, prosody))
 
     async def _collect(
-        self, text: str, voice: str, speed: float
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
     ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
         import edge_tts
 
-        rate = f"{round((speed - 1) * 100):+d}%"
-        communicate = edge_tts.Communicate(text, voice, rate=rate, boundary="WordBoundary")
+        rate_pct = round((_effective_speed(speed, prosody) - 1) * 100)
+        communicate = edge_tts.Communicate(
+            text,
+            voice,
+            rate=f"{max(-50, min(100, rate_pct)):+d}%",
+            pitch=f"{prosody.pitch_hz if prosody else 0:+d}Hz",
+            volume=f"{prosody.volume_pct if prosody else 0:+d}%",
+            boundary="WordBoundary",
+        )
         mp3 = bytearray()
         words: list[dict[str, Any]] = []
         async for event in communicate.stream():
@@ -263,12 +310,435 @@ def _decode_mp3(data: bytes) -> np.ndarray:
     return np.frombuffer(result.stdout, dtype="<i2").astype(np.float32) / 32767.0
 
 
-def write_chunk_cache(path: Path, samples: np.ndarray, rate: int, words: list[dict[str, Any]]) -> None:
+class OrpheusSpeechEngine(SpeechEngine):
+    """Orpheus 3B (Apache-2.0) served by llama.cpp, decoded with SNAC ONNX.
+
+    Performs truly emotive narration: laughter, sighs, gasps and natural breath are
+    generated as audio, directed by the semantic acting cues from the emotion
+    planner. Falls back to edge-tts per piece if the inference host is down so
+    narration never stalls.
+    """
+
+    voices = ORPHEUS_VOICES
+    has_word_timings = False
+    streams_pcm = True
+
+    SNAC_FILE = "snac_24khz.decoder.onnx"
+    TOKEN_PATTERN = re.compile(r"<custom_token_(\d+)>")
+    TOKEN_OFFSET = 10
+    CODEBOOK = 4096
+    FRAME = 7
+    WINDOW_FRAMES = 4  # sliding SNAC decode window
+    SAMPLES_PER_FRAME = 2048
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._snac: Any = None
+        self._snac_inputs: list[str] = []
+        self._fallback = EdgeSpeechEngine()
+
+    def _load_snac(self):
+        if self._snac is None:
+            import onnxruntime
+
+            options = onnxruntime.SessionOptions()
+            options.intra_op_num_threads = 2
+            self._snac = onnxruntime.InferenceSession(
+                str(get_settings().models_dir / self.SNAC_FILE),
+                options,
+                providers=["CPUExecutionProvider"],
+            )
+            self._snac_inputs = [item.name for item in self._snac.get_inputs()]
+        return self._snac
+
+    def _fallback_voice(self, voice: str) -> str:
+        gender = next((v["gender"] for v in self.voices if v["id"] == voice), "female")
+        return "en-US-AriaNeural" if gender == "female" else "en-US-GuyNeural"
+
+    def _tagged_text(self, text: str, prosody: Prosody | None) -> str:
+        if prosody is None:
+            return text
+        lead = ORPHEUS_TAGS.get(prosody.lead_tag, "")
+        trail = ORPHEUS_TAGS.get(prosody.trail_tag, "")
+        return f"{lead} {text} {trail}".strip()
+
+    def _completion(self, text: str, voice: str, stability: float) -> list[int]:
+        import urllib.request
+
+        body = {
+            "prompt": f"<custom_token_3>{voice}: {text}<|eot_id|><custom_token_4>",
+            "n_predict": 6144,
+            "temperature": 0.6 + (0.5 - stability) * 0.4,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "cache_prompt": False,
+        }
+        request = urllib.request.Request(
+            f"{get_settings().orpheus_url}/completion",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=300) as response:
+            content = json.loads(response.read())["content"]
+        # The model prefixes marker tokens and opens the audio stream with
+        # <custom_token_1>; only tokens after that marker are SNAC codes.
+        if "<custom_token_1>" in content:
+            content = content.rsplit("<custom_token_1>", 1)[1]
+        return [int(match) for match in self.TOKEN_PATTERN.findall(content) if int(match) >= 10]
+
+    def _decode_tokens(self, tokens: list[int]) -> np.ndarray:
+        codes = [token - self.TOKEN_OFFSET - ((index % self.FRAME) * self.CODEBOOK)
+                 for index, token in enumerate(tokens)]
+        frames = len(codes) // self.FRAME
+        if frames == 0:
+            raise ValueError("Orpheus returned no audio frames")
+        layer0: list[int] = []
+        layer1: list[int] = []
+        layer2: list[int] = []
+        for index in range(frames):
+            chunk = codes[index * self.FRAME : (index + 1) * self.FRAME]
+            if any(code < 0 or code >= self.CODEBOOK for code in chunk):
+                continue
+            layer0.append(chunk[0])
+            layer1.extend((chunk[1], chunk[4]))
+            layer2.extend((chunk[2], chunk[3], chunk[5], chunk[6]))
+        if not layer0:
+            raise ValueError("Orpheus returned malformed audio frames")
+        snac = self._load_snac()
+        feeds = dict(
+            zip(
+                self._snac_inputs,
+                (
+                    np.array([layer0], dtype=np.int64),
+                    np.array([layer1], dtype=np.int64),
+                    np.array([layer2], dtype=np.int64),
+                ),
+            )
+        )
+        waveform = snac.run(None, feeds)[0]
+        return np.asarray(waveform, dtype=np.float32).reshape(-1)
+
+    LEAD_TAG_SECONDS = 0.8
+    TRAIL_TAG_SECONDS = 0.7
+
+    def _tag_reserves(self, duration: float, prosody: Prosody | None) -> tuple[float, float]:
+        lead = self.LEAD_TAG_SECONDS if self.performs(prosody.lead_tag if prosody else "") else 0.0
+        trail = self.TRAIL_TAG_SECONDS if self.performs(prosody.trail_tag if prosody else "") else 0.0
+        if lead + trail > duration * 0.5 and lead + trail > 0:
+            scale = duration * 0.5 / (lead + trail)
+            lead *= scale
+            trail *= scale
+        return lead, trail
+
+    def _estimate_words(
+        self, text: str, duration: float, prosody: Prosody | None
+    ) -> list[dict[str, Any]]:
+        # Emotive tags (a chuckle, a sigh) are performed as audio before/after
+        # the words; reserve their time so the karaoke highlight stays in sync.
+        lead, trail = self._tag_reserves(duration, prosody)
+        spoken = duration - lead - trail
+        tokens = [token for token in text.split() if token]
+        weights = [len(token) + 1 for token in tokens]
+        total = sum(weights) or 1
+        words: list[dict[str, Any]] = []
+        cursor = lead
+        for token, weight in zip(tokens, weights):
+            span = spoken * weight / total
+            words.append({"word": token, "start": round(cursor, 3), "end": round(cursor + span, 3)})
+            cursor += span
+        return words
+
+    def _align_words(
+        self, text: str, samples: np.ndarray, rate: int, prosody: Prosody | None
+    ) -> list[dict[str, Any]]:
+        """Word timings aligned to the actual speech energy in the audio.
+
+        An RMS envelope marks voiced regions; words are distributed over voiced
+        time only, so the highlight waits through real pauses and through the
+        performed cues (chuckles, sighs) instead of drifting ahead.
+        """
+        duration = len(samples) / rate
+        hop = int(rate * 0.02)
+        if hop == 0 or len(samples) < hop * 8:
+            return self._estimate_words(text, duration, prosody)
+        frame_count = len(samples) // hop
+        frames = samples[: frame_count * hop].reshape(frame_count, hop)
+        energy = np.sqrt(np.mean(frames * frames, axis=1))
+        threshold = max(float(np.percentile(energy, 15)) * 3.0, float(energy.max()) * 0.07)
+        voiced = energy > threshold
+        # Close sub-100ms dips so single words are not split apart.
+        gap = 0
+        for index in range(len(voiced)):
+            if voiced[index]:
+                if 0 < gap <= 5:
+                    voiced[index - gap : index] = True
+                gap = 0
+            else:
+                gap += 1
+        spans: list[list[float]] = []
+        start: int | None = None
+        for index, flag in enumerate(voiced):
+            if flag and start is None:
+                start = index
+            elif not flag and start is not None:
+                spans.append([start * 0.02, index * 0.02])
+                start = None
+        if start is not None:
+            spans.append([start * 0.02, frame_count * 0.02])
+        lead, trail = self._tag_reserves(duration, prosody)
+        if lead > 0:
+            spans = [span for span in spans if span[1] > lead * 0.75]
+            if spans and spans[0][0] < lead * 0.5:
+                spans[0][0] = min(spans[0][1], lead * 0.75)
+        if trail > 0:
+            cutoff = duration - trail * 0.75
+            spans = [span for span in spans if span[0] < cutoff]
+        if not spans:
+            return self._estimate_words(text, duration, prosody)
+        voiced_total = sum(end - start for start, end in spans)
+        tokens = [token for token in text.split() if token]
+        weights = [len(token) + 1 for token in tokens]
+        total = sum(weights) or 1
+
+        def absolute(position: float) -> float:
+            remaining = position
+            for span_start, span_end in spans:
+                length = span_end - span_start
+                if remaining <= length:
+                    return span_start + remaining
+                remaining -= length
+            return spans[-1][1]
+
+        words: list[dict[str, Any]] = []
+        cumulative = 0.0
+        for token, weight in zip(tokens, weights):
+            begin = absolute(cumulative / total * voiced_total)
+            cumulative += weight
+            end = absolute(cumulative / total * voiced_total)
+            words.append({"word": token, "start": round(begin, 3), "end": round(end, 3)})
+        return words
+
+    def performs(self, tag: str) -> bool:
+        return tag in ORPHEUS_TAGS
+
+    def _synthesize_samples(
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
+    ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
+        try:
+            stability = prosody.stability if prosody else 0.5
+            tokens = self._completion(self._tagged_text(text, prosody), voice, stability)
+            samples = self._decode_tokens(tokens)
+        except Exception as exc:
+            logger.warning("Orpheus synthesis failed (%s); falling back to edge-tts", exc)
+            return self._fallback._synthesize_samples(
+                text, self._fallback_voice(voice), speed, prosody
+            )
+        if abs(speed - 1.0) > 0.01:
+            samples = _atempo(samples, speed)
+        words = self._align_words(text, samples, SAMPLE_RATE, prosody)
+        return samples, SAMPLE_RATE, words
+
+    def _stream_tokens(self, text: str, voice: str, stability: float):
+        """Yield SNAC token ids as llama-server streams the completion."""
+        import urllib.request
+
+        body = {
+            "prompt": f"<custom_token_3>{voice}: {text}<|eot_id|><custom_token_4>",
+            "n_predict": 6144,
+            "temperature": 0.6 + (0.5 - stability) * 0.4,
+            "top_p": 0.9,
+            "repeat_penalty": 1.1,
+            "cache_prompt": False,
+            "stream": True,
+        }
+        request = urllib.request.Request(
+            f"{get_settings().orpheus_url}/completion",
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        buffer = ""
+        audio_started = False
+        with urllib.request.urlopen(request, timeout=300) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8", "ignore").strip()
+                if not line.startswith("data: "):
+                    continue
+                payload = json.loads(line[6:])
+                buffer += payload.get("content", "")
+                if not audio_started:
+                    marker = buffer.rfind("<custom_token_1>")
+                    if marker < 0:
+                        continue
+                    buffer = buffer[marker + len("<custom_token_1>") :]
+                    audio_started = True
+                while True:
+                    match = self.TOKEN_PATTERN.search(buffer)
+                    if match is None or match.end() == len(buffer):
+                        break
+                    buffer = buffer[match.end() :]
+                    value = int(match.group(1))
+                    if value >= self.TOKEN_OFFSET:
+                        yield value
+                if payload.get("stop"):
+                    match = self.TOKEN_PATTERN.search(buffer)
+                    if match is not None and int(match.group(1)) >= self.TOKEN_OFFSET:
+                        yield int(match.group(1))
+                    return
+
+    def _decode_window(self, codes: list[int], start_frame: int, end_frame: int) -> np.ndarray:
+        layer0: list[int] = []
+        layer1: list[int] = []
+        layer2: list[int] = []
+        for index in range(start_frame, end_frame):
+            chunk = codes[index * self.FRAME : (index + 1) * self.FRAME]
+            layer0.append(chunk[0])
+            layer1.extend((chunk[1], chunk[4]))
+            layer2.extend((chunk[2], chunk[3], chunk[5], chunk[6]))
+        snac = self._load_snac()
+        feeds = dict(
+            zip(
+                self._snac_inputs,
+                (
+                    np.array([layer0], dtype=np.int64),
+                    np.array([layer1], dtype=np.int64),
+                    np.array([layer2], dtype=np.int64),
+                ),
+            )
+        )
+        waveform = snac.run(None, feeds)[0]
+        return np.asarray(waveform, dtype=np.float32).reshape(-1)
+
+    def _stream_blocks(self, text: str, voice: str, stability: float):
+        """Yield PCM blocks with a sliding 4-frame SNAC window for clean joins."""
+        spf = self.SAMPLES_PER_FRAME
+        window = self.WINDOW_FRAMES
+        codes: list[int] = []
+        valid_frames = 0
+        pending: list[int] = []
+        for token in self._stream_tokens(text, voice, stability):
+            position = len(codes) + len(pending)
+            pending.append(token - self.TOKEN_OFFSET - (position % self.FRAME) * self.CODEBOOK)
+            if len(pending) < self.FRAME:
+                continue
+            if all(0 <= code < self.CODEBOOK for code in pending):
+                codes.extend(pending)
+                valid_frames += 1
+            pending = []
+            if valid_frames == window:
+                yield self._decode_window(codes, 0, window)[: spf * (window - 1)]
+            elif valid_frames > window:
+                yield self._decode_window(codes, valid_frames - window, valid_frames)[
+                    spf * (window - 2) : spf * (window - 1)
+                ]
+        if valid_frames == 0:
+            raise ValueError("Orpheus returned no audio frames")
+        if valid_frames < window:
+            yield self._decode_window(codes, 0, valid_frames)
+        else:
+            yield self._decode_window(codes, valid_frames - window, valid_frames)[spf * (window - 1) :]
+
+    async def stream_sentence(
+        self,
+        text: str,
+        voice: str,
+        speed: float,
+        prosody: Prosody | None,
+        on_pcm,
+    ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
+        if abs(speed - 1.0) > 0.01:
+            return await super().stream_sentence(text, voice, speed, prosody, on_pcm)
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            queue: asyncio.Queue = asyncio.Queue()
+            stability = prosody.stability if prosody else 0.5
+            tagged = self._tagged_text(text, prosody)
+
+            def produce() -> None:
+                try:
+                    for block in self._stream_blocks(tagged, voice, stability):
+                        loop.call_soon_threadsafe(queue.put_nowait, ("pcm", block))
+                    loop.call_soon_threadsafe(queue.put_nowait, ("end", None))
+                except Exception as exc:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+
+            producer = loop.run_in_executor(None, produce)
+            parts: list[np.ndarray] = []
+            try:
+                while True:
+                    kind, payload = await queue.get()
+                    if kind == "pcm":
+                        parts.append(payload)
+                        await on_pcm(payload)
+                    elif kind == "end":
+                        break
+                    else:
+                        raise payload
+            except Exception as exc:
+                if parts:
+                    raise
+                logger.warning("Orpheus stream failed (%s); falling back to edge-tts", exc)
+                samples, rate, words = await asyncio.to_thread(
+                    self._fallback._synthesize_samples,
+                    text,
+                    self._fallback_voice(voice),
+                    speed,
+                    prosody,
+                )
+                await on_pcm(samples)
+                return samples, rate, words
+            finally:
+                await producer
+            samples = np.concatenate(parts)
+            words = self._align_words(text, samples, SAMPLE_RATE, prosody)
+            return samples, SAMPLE_RATE, words
+
+
+def _atempo(samples: np.ndarray, speed: float) -> np.ndarray:
+    import subprocess
+
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767).astype("<i2").tobytes()
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "1",
+            "-i",
+            "pipe:0",
+            "-filter:a",
+            f"atempo={max(0.5, min(2.0, speed))}",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        input=pcm,
+        capture_output=True,
+        check=True,
+    )
+    return np.frombuffer(result.stdout, dtype="<i2").astype(np.float32) / 32767.0
+
+
+def write_chunk_cache(
+    path: Path,
+    samples: np.ndarray,
+    rate: int,
+    words: list[dict[str, Any]],
+    sentences: list[dict[str, Any]] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temp = path.with_name(f"{path.name}.tmp")
     temp.write_bytes(_wav_bytes(samples, rate))
     temp.rename(path)
-    timing_path(path).write_text(json.dumps({"words": words}, ensure_ascii=False))
+    payload: dict[str, Any] = {"words": words}
+    if sentences:
+        payload["sentences"] = sentences
+    timing_path(path).write_text(json.dumps(payload, ensure_ascii=False))
 
 
 def _create_engine() -> SpeechEngine:
@@ -277,6 +747,8 @@ def _create_engine() -> SpeechEngine:
         return OnnxSpeechEngine()
     if selected == "edge":
         return EdgeSpeechEngine()
+    if selected == "orpheus":
+        return OrpheusSpeechEngine()
     return TorchSpeechEngine()
 
 
@@ -293,41 +765,20 @@ def resolve_voice(requested: str | None) -> str:
         return preferred
     return VOICES[0]["id"]
 
-_prefetch_tasks: set[asyncio.Task] = set()
-
-
-def audio_path(book_id: uuid.UUID, voice: str, chunk_id: str) -> Path:
-    return get_settings().audio_dir / str(book_id) / voice / f"{chunk_id}.wav"
+def audio_path(
+    book_id: uuid.UUID, voice: str, emotion: str, chunk_id: str, speech: str
+) -> Path:
+    digest = hashlib.sha1(speech.encode("utf-8")).hexdigest()[:8]
+    return get_settings().audio_dir / str(book_id) / voice / emotion / f"{chunk_id}-{digest}.wav"
 
 
 def timing_path(audio_file: Path) -> Path:
     return audio_file.with_suffix(".json")
 
 
-async def ensure_audio(book_id: uuid.UUID, voice: str, chunk: dict) -> Path:
-    return await engine.synthesize_to_file(
-        chunk["speech"], voice, audio_path(book_id, voice, chunk["id"])
-    )
-
-
-def _prefetch_done(task: asyncio.Task) -> None:
-    _prefetch_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        logger.warning("Audio prefetch failed: %s", task.exception())
-
-
-def prefetch(book_id: uuid.UUID, voice: str, chunks: list[dict]) -> None:
-    for chunk in chunks:
-        if audio_path(book_id, voice, chunk["id"]).exists():
-            continue
-        task = asyncio.create_task(ensure_audio(book_id, voice, chunk))
-        _prefetch_tasks.add(task)
-        task.add_done_callback(_prefetch_done)
-
-
 async def warmup() -> None:
     try:
-        await asyncio.to_thread(engine._synthesize, "Bookly is ready.", get_settings().default_voice)
+        await engine.synthesize_sentence("Bookly is ready.", resolve_voice(None), 1.0)
         logger.info("TTS engine warmed up")
     except Exception:
         logger.exception("TTS warmup failed")
