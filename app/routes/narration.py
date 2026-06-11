@@ -104,6 +104,34 @@ async def get_page_content(page_number: int, book: OwnedBook, request: Request) 
     )
 
 
+class WarmChunk:
+    """Partially synthesized chunk held in session memory for instant starts."""
+
+    def __init__(
+        self, chunk_id: str, speech: str, voice: str, emotion: str, speed: float
+    ) -> None:
+        self.chunk_id = chunk_id
+        self.speech = speech
+        self.voice = voice
+        self.emotion = emotion
+        self.speed = speed
+        self.index = 0
+        self.offset = 0.0
+        self.parts: list[np.ndarray] = []
+        self.frames: list[dict[str, Any]] = []
+        self.collected: list[dict[str, Any]] = []
+        self.complete = False
+
+    def matches(self, session: "NarrationSession", chunk_id: str, speech: str) -> bool:
+        return (
+            self.chunk_id == chunk_id
+            and self.speech == speech
+            and self.voice == session.voice
+            and self.emotion == session.emotion
+            and self.speed == session.speed
+        )
+
+
 class NarrationSession:
     def __init__(self, voice: str, speed: float, emotion: str) -> None:
         self.voice = voice
@@ -111,6 +139,8 @@ class NarrationSession:
         self.emotion = emotion
         self.current: str | None = None
         self.pending: str | None = None
+        self.warm_target: str | None = None
+        self.warm: WarmChunk | None = None
         self.flush = False
         self.acked = False
         self.stopped = False
@@ -212,87 +242,100 @@ def _polish_done(task: asyncio.Task) -> None:
         logger.warning("Background polish failed: %s", task.exception())
 
 
-async def _prefetch_chunk(
-    session: NarrationSession, book_id: uuid.UUID, chunk: dict[str, Any]
-) -> None:
-    """Pre-synthesize the next chunk into the cache while the current one plays.
+async def _synthesize_piece(
+    piece: str, index: int, pieces: list[str], session: NarrationSession
+) -> tuple[np.ndarray, int, list[dict[str, Any]], Any]:
+    prosody = await asyncio.to_thread(
+        lambda: plan(
+            piece,
+            session.emotion,
+            first=index == 0,
+            last=index == len(pieces) - 1,
+            next_chars=len(pieces[index + 1]) if index + 1 < len(pieces) else None,
+        )
+    )
+    samples, rate, words = await engine.synthesize_sentence(
+        piece, session.voice, session.speed, prosody
+    )
+    pre = prosody.pre_pause / session.speed
+    post = prosody.post_pause / session.speed
+    samples = _pad_silence(samples, rate, pre, post)
+    return samples, rate, words, prosody
 
-    Mirrors the uncached streaming path without a websocket so a sequential
-    listener almost always lands on a cache hit. Aborts between pieces if the
-    listener seeks or stops, so live synthesis is never starved for long.
+
+def _piece_frame(
+    piece: str, offset: float, pre: float, words: list[dict[str, Any]], prosody
+) -> dict[str, Any]:
+    shifted = [
+        {
+            **word,
+            "start": round(word["start"] + offset + pre, 3),
+            "end": round(word["end"] + offset + pre, 3),
+        }
+        for word in words
+    ]
+    return {
+        "text": piece,
+        "offset": round(offset, 3),
+        "words": shifted,
+        "cues": {
+            "lead": prosody.lead_tag if engine.performs(prosody.lead_tag) else "",
+            "trail": prosody.trail_tag if engine.performs(prosody.trail_tag) else "",
+        },
+    }
+
+
+async def _warm_step(
+    session: NarrationSession, book_id: uuid.UUID, content: dict[str, Any]
+) -> bool:
+    """Synthesize one piece of the warm-target chunk into session memory.
+
+    Runs whenever the main loop is otherwise idle, so a Play (or the next-chunk
+    advance) lands on audio that already exists. Returns False when there is
+    nothing (more) to warm.
     """
-    voice = session.voice
-    emotion = session.emotion
-    speech = chunk["speech"]
-    cache = audio_path(book_id, voice, emotion, chunk["id"], speech)
-    if session.speed != 1.0 or (cache.exists() and not _cache_is_stale(cache)):
-        return
-    offset = 0.0
-    parts: list[np.ndarray] = []
-    collected: list[dict[str, Any]] = []
-    frames: list[dict[str, Any]] = []
-    rate = SAMPLE_RATE
-    pieces = split_for_streaming(speech)
-    for index, piece in enumerate(pieces):
-        if session.stopped or session.pending is not None:
-            return
-        if session.voice != voice or session.emotion != emotion or session.speed != 1.0:
-            return
-        prosody = await asyncio.to_thread(
-            lambda p=piece, i=index: plan(
-                p,
-                emotion,
-                first=i == 0,
-                last=i == len(pieces) - 1,
-                next_chars=len(pieces[i + 1]) if i + 1 < len(pieces) else None,
-            )
+    target = session.warm_target
+    if target is None or session.speed != 1.0:
+        session.warm_target = None
+        return False
+    chunk = find_chunk(content, target)
+    if chunk is None:
+        session.warm_target = None
+        return False
+    cache = audio_path(book_id, session.voice, session.emotion, chunk["id"], chunk["speech"])
+    if cache.exists() and not _cache_is_stale(cache):
+        session.warm_target = None
+        return False
+    warm = session.warm
+    if warm is None or not warm.matches(session, chunk["id"], chunk["speech"]):
+        warm = WarmChunk(
+            chunk["id"], chunk["speech"], session.voice, session.emotion, session.speed
         )
-        samples, rate, words = await engine.synthesize_sentence(piece, voice, 1.0, prosody)
-        pre = prosody.pre_pause
-        post = prosody.post_pause
-        samples = _pad_silence(samples, rate, pre, post)
-        shifted = [
-            {
-                **word,
-                "start": round(word["start"] + offset + pre, 3),
-                "end": round(word["end"] + offset + pre, 3),
-            }
-            for word in words
-        ]
-        frames.append(
-            {
-                "text": piece,
-                "offset": round(offset, 3),
-                "words": shifted,
-                "cues": {
-                    "lead": prosody.lead_tag if engine.performs(prosody.lead_tag) else "",
-                    "trail": prosody.trail_tag if engine.performs(prosody.trail_tag) else "",
-                },
-            }
+        session.warm = warm
+    if warm.complete:
+        session.warm_target = None
+        return False
+    pieces = split_for_streaming(warm.speech)
+    piece = pieces[warm.index]
+    samples, rate, words, prosody = await _synthesize_piece(piece, warm.index, pieces, session)
+    # Settings or polish may have changed underneath the synthesis; discard stale warms.
+    if not warm.matches(session, chunk["id"], chunk["speech"]):
+        session.warm = None
+        return True
+    pre = prosody.pre_pause / session.speed
+    warm.frames.append(_piece_frame(piece, warm.offset, pre, words, prosody))
+    warm.parts.append(samples)
+    warm.collected.extend(warm.frames[-1]["words"])
+    warm.offset += len(samples) / rate
+    warm.index += 1
+    if warm.index >= len(pieces):
+        warm.complete = True
+        session.warm_target = None
+        combined = np.concatenate(warm.parts)
+        await anyio.to_thread.run_sync(
+            write_chunk_cache, cache, combined, rate, warm.collected, warm.frames
         )
-        offset += len(samples) / rate
-        parts.append(samples)
-        collected.extend(shifted)
-    if parts:
-        combined = np.concatenate(parts)
-        await anyio.to_thread.run_sync(write_chunk_cache, cache, combined, rate, collected, frames)
-
-
-_prefetch_tasks: set[asyncio.Task] = set()
-
-
-def _kick_prefetch(session: NarrationSession, book_id: uuid.UUID, chunk: dict[str, Any]) -> None:
-    if len(_prefetch_tasks) >= 1:
-        return
-    task = asyncio.create_task(_prefetch_chunk(session, book_id, chunk))
-    _prefetch_tasks.add(task)
-    task.add_done_callback(_prefetch_done)
-
-
-def _prefetch_done(task: asyncio.Task) -> None:
-    _prefetch_tasks.discard(task)
-    if not task.cancelled() and task.exception() is not None:
-        logger.warning("Chunk prefetch failed: %s", task.exception())
+    return True
 
 
 def _cache_is_stale(path) -> bool:
@@ -395,7 +438,21 @@ async def _stream_chunk(
     rate = SAMPLE_RATE
     complete = True
     pieces = split_for_streaming(speech)
-    for index, piece in enumerate(pieces):
+    start_index = 0
+    warm = session.warm
+    if warm is not None and warm.matches(session, chunk["id"], speech) and warm.parts:
+        # Warm start: flush everything already synthesized in the background,
+        # then continue live from where the warm-up left off.
+        for frame, samples in zip(warm.frames, warm.parts):
+            await websocket.send_json({"type": "sentence", "chunk_id": chunk["id"], **frame})
+            await _send_pcm(websocket, pcm16_bytes(samples))
+        offset = warm.offset
+        parts = warm.parts
+        collected = list(warm.collected)
+        frames = list(warm.frames)
+        start_index = warm.index
+        session.warm = None
+    for index, piece in enumerate(pieces[start_index:], start=start_index):
         if session.flush or session.stopped:
             complete = False
             break
@@ -523,6 +580,10 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
     try:
         while not session.stopped:
             if session.pending is None:
+                if session.warm_target is not None and await _warm_step(
+                    session, book_id, content
+                ):
+                    continue
                 await session.wait()
                 continue
             chunk_id = session.pending
@@ -542,9 +603,13 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
                 continue
             upcoming = adjacent_chunk(content, chunk["id"], 1)
             if upcoming is not None:
-                _kick_prefetch(session, book_id, upcoming)
+                session.warm_target = upcoming["id"]
             session.acked = False
             while not (session.acked or session.pending is not None or session.stopped):
+                if session.warm_target is not None and await _warm_step(
+                    session, book_id, content
+                ):
+                    continue
                 await session.wait()
             if session.acked and session.pending is None:
                 next_chunk = adjacent_chunk(content, session.current, 1)
