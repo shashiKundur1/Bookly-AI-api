@@ -25,6 +25,7 @@ class Prosody:
     lead_tag: str = ""  # semantic acting cue opening the piece (engine translates)
     trail_tag: str = ""  # semantic acting cue closing the piece
     stability: float = 0.5  # expressiveness: 0.0 = most theatrical, 1.0 = most even
+    emotion: str = "narrator"  # active preset id, for engines that take direction
 
 
 @dataclass(frozen=True)
@@ -284,6 +285,7 @@ def plan(
         lead_tag=lead,
         trail_tag=trail,
         stability=preset.stability,
+        emotion=emotion if emotion in PRESETS else DEFAULT_EMOTION,
     )
 
 

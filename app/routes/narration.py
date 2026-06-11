@@ -212,6 +212,89 @@ def _polish_done(task: asyncio.Task) -> None:
         logger.warning("Background polish failed: %s", task.exception())
 
 
+async def _prefetch_chunk(
+    session: NarrationSession, book_id: uuid.UUID, chunk: dict[str, Any]
+) -> None:
+    """Pre-synthesize the next chunk into the cache while the current one plays.
+
+    Mirrors the uncached streaming path without a websocket so a sequential
+    listener almost always lands on a cache hit. Aborts between pieces if the
+    listener seeks or stops, so live synthesis is never starved for long.
+    """
+    voice = session.voice
+    emotion = session.emotion
+    speech = chunk["speech"]
+    cache = audio_path(book_id, voice, emotion, chunk["id"], speech)
+    if session.speed != 1.0 or (cache.exists() and not _cache_is_stale(cache)):
+        return
+    offset = 0.0
+    parts: list[np.ndarray] = []
+    collected: list[dict[str, Any]] = []
+    frames: list[dict[str, Any]] = []
+    rate = SAMPLE_RATE
+    pieces = split_for_streaming(speech)
+    for index, piece in enumerate(pieces):
+        if session.stopped or session.pending is not None:
+            return
+        if session.voice != voice or session.emotion != emotion or session.speed != 1.0:
+            return
+        prosody = await asyncio.to_thread(
+            lambda p=piece, i=index: plan(
+                p,
+                emotion,
+                first=i == 0,
+                last=i == len(pieces) - 1,
+                next_chars=len(pieces[i + 1]) if i + 1 < len(pieces) else None,
+            )
+        )
+        samples, rate, words = await engine.synthesize_sentence(piece, voice, 1.0, prosody)
+        pre = prosody.pre_pause
+        post = prosody.post_pause
+        samples = _pad_silence(samples, rate, pre, post)
+        shifted = [
+            {
+                **word,
+                "start": round(word["start"] + offset + pre, 3),
+                "end": round(word["end"] + offset + pre, 3),
+            }
+            for word in words
+        ]
+        frames.append(
+            {
+                "text": piece,
+                "offset": round(offset, 3),
+                "words": shifted,
+                "cues": {
+                    "lead": prosody.lead_tag if engine.performs(prosody.lead_tag) else "",
+                    "trail": prosody.trail_tag if engine.performs(prosody.trail_tag) else "",
+                },
+            }
+        )
+        offset += len(samples) / rate
+        parts.append(samples)
+        collected.extend(shifted)
+    if parts:
+        combined = np.concatenate(parts)
+        await anyio.to_thread.run_sync(write_chunk_cache, cache, combined, rate, collected, frames)
+
+
+_prefetch_tasks: set[asyncio.Task] = set()
+
+
+def _kick_prefetch(session: NarrationSession, book_id: uuid.UUID, chunk: dict[str, Any]) -> None:
+    if len(_prefetch_tasks) >= 1:
+        return
+    task = asyncio.create_task(_prefetch_chunk(session, book_id, chunk))
+    _prefetch_tasks.add(task)
+    task.add_done_callback(_prefetch_done)
+
+
+def _prefetch_done(task: asyncio.Task) -> None:
+    _prefetch_tasks.discard(task)
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning("Chunk prefetch failed: %s", task.exception())
+
+
 def _cache_is_stale(path) -> bool:
     if not engine.has_word_timings:
         return False
@@ -457,6 +540,9 @@ async def narrate_socket(websocket: WebSocket, book_id: uuid.UUID) -> None:
             await _stream_chunk(websocket, session, book_id, chunk)
             if session.stopped or session.pending is not None:
                 continue
+            upcoming = adjacent_chunk(content, chunk["id"], 1)
+            if upcoming is not None:
+                _kick_prefetch(session, book_id, upcoming)
             session.acked = False
             while not (session.acked or session.pending is not None or session.stopped):
                 await session.wait()

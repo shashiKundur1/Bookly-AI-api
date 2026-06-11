@@ -21,6 +21,7 @@ class Settings(BaseSettings):
     default_voice: str = "af_heart"
     tts_engine: str = "kokoro"
     gemini_api_key: str = ""
+    gemini_tts_model: str = "gemini-3.1-flash-tts-preview"
     orpheus_url: str = "http://localhost:8080"
 
     @property

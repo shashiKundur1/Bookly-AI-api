@@ -10,7 +10,7 @@ Every user only ever sees their own books.
 - **PyMuPDF** for PDF processing: text + layout extraction, table of contents, cover rendering
 - **Real-time narration over WebSockets** — sentences are synthesized one by one and streamed as raw PCM (sub-second first audio with the streaming engine), and the text, highlight, and page turns stay in sync with what is actually being spoken
 - **Emotional narration** — 12 selectable tones (narrator, storyteller, dramatic, cinematic, excited, calm, whisper, …) drive pacing, pitch, and acting cues. A GoEmotions classifier (RoBERTa int8, 28 human emotion labels, runs on CPU via onnxruntime) reads every sentence and steers the delivery: laughter where the text is amused, hushed nerves where it is afraid. Boundary pauses follow speech-breathing research (sentence ≈ 0.6–0.9 s, paragraph ≈ 1.0–1.5 s, scaled by tone) — narrators inhale between lines, so there are no fake exhale sounds, ever
-- **Four TTS engines** behind one interface, chosen with `TTS_ENGINE`: `orpheus` (Orpheus 3B via llama.cpp + SNAC, truly emotive open-source voice with real laughs/gasps/breaths, streams PCM as it decodes; needs a llama-server host — see `ORPHEUS_URL`), `edge` (edge-tts neural voices: real-time on tiny servers, word timestamps), `kokoro` (torch, offline, word timestamps), and `kokoro-onnx` (lightweight offline). Engines degrade gracefully: if the Orpheus host is down, pieces fall back to edge-tts so narration never stalls
+- **Five TTS engines** behind one interface, chosen with `TTS_ENGINE`: `gemini` (Gemini native TTS on the free API tier: cloud-side emotional acting — directed chuckles, gasps, whispers — zero server RAM, automatic edge-tts fallback on quota errors), `orpheus` (Orpheus 3B via llama.cpp + SNAC, truly emotive open-source voice with real laughs/gasps/breaths, streams PCM as it decodes; needs a llama-server host — see `ORPHEUS_URL`), `edge` (edge-tts neural voices: real-time on tiny servers, word timestamps), `kokoro` (torch, offline, word timestamps), and `kokoro-onnx` (lightweight offline). Engines degrade gracefully: if the Orpheus host is down, pieces fall back to edge-tts so narration never stalls
 - **Gemini** (optional) to polish narration text for awkward pages like tables — used only when `GEMINI_API_KEY` is set, with automatic fallback. Everything in this project runs on free and open-source resources
 - **Docker Compose** for the whole stack, with hot reload in development
 
@@ -58,7 +58,8 @@ Book organization is first-class: status (`to_read`, `reading`, `finished`), pri
 | `CORS_ORIGINS` | `["http://localhost:3000"]` | allowed browser origins |
 | `MAX_UPLOAD_MB` | 200 | PDF size cap |
 | `DEFAULT_VOICE` | `af_heart` | narration voice when none is chosen (auto-mapped per engine) |
-| `TTS_ENGINE` | `kokoro` | `orpheus` (emotive, needs llama-server), `edge` (real-time neural voices), `kokoro` (torch), or `kokoro-onnx` (lite offline) |
+| `TTS_ENGINE` | `kokoro` | `gemini` (free-tier emotional acting, recommended for small servers), `orpheus` (emotive, needs llama-server), `edge` (real-time neural voices), `kokoro` (torch), or `kokoro-onnx` (lite offline) |
+| `GEMINI_TTS_MODEL` | `gemini-3.1-flash-tts-preview` | Gemini TTS model used when `TTS_ENGINE=gemini` |
 | `ORPHEUS_URL` | `http://localhost:8080` | llama-server hosting `orpheus-3b-0.1-ft-q4_k_m.gguf` (run: `llama-server -m data/models/orpheus-3b-0.1-ft-q4_k_m.gguf -c 8192 --port 8080 -ngl 99`); needs `snac_24khz.decoder.onnx` in `data/models` |
 | `GEMINI_API_KEY` | empty | enables AI narration polish |
 | `COOKIE_SECURE` | false | set true behind HTTPS |

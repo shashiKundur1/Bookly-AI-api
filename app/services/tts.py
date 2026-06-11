@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import io
 import json
@@ -143,6 +144,9 @@ class SpeechEngine:
     has_word_timings = False
     streams_pcm = False
 
+    LEAD_TAG_SECONDS = 0.8
+    TRAIL_TAG_SECONDS = 0.7
+
     def performs(self, tag: str) -> bool:
         """Whether the engine audibly acts out the given semantic cue."""
         return False
@@ -150,6 +154,103 @@ class SpeechEngine:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self.voice_ids = {voice["id"] for voice in self.voices}
+
+    def _tag_reserves(self, duration: float, prosody: Prosody | None) -> tuple[float, float]:
+        lead = self.LEAD_TAG_SECONDS if self.performs(prosody.lead_tag if prosody else "") else 0.0
+        trail = self.TRAIL_TAG_SECONDS if self.performs(prosody.trail_tag if prosody else "") else 0.0
+        if lead + trail > duration * 0.5 and lead + trail > 0:
+            scale = duration * 0.5 / (lead + trail)
+            lead *= scale
+            trail *= scale
+        return lead, trail
+
+    def _estimate_words(
+        self, text: str, duration: float, prosody: Prosody | None
+    ) -> list[dict[str, Any]]:
+        # Emotive cues (a chuckle, a gasp) are performed as audio before/after
+        # the words; reserve their time so the karaoke highlight stays in sync.
+        lead, trail = self._tag_reserves(duration, prosody)
+        spoken = duration - lead - trail
+        tokens = [token for token in text.split() if token]
+        weights = [len(token) + 1 for token in tokens]
+        total = sum(weights) or 1
+        words: list[dict[str, Any]] = []
+        cursor = lead
+        for token, weight in zip(tokens, weights):
+            span = spoken * weight / total
+            words.append({"word": token, "start": round(cursor, 3), "end": round(cursor + span, 3)})
+            cursor += span
+        return words
+
+    def _align_words(
+        self, text: str, samples: np.ndarray, rate: int, prosody: Prosody | None
+    ) -> list[dict[str, Any]]:
+        """Word timings aligned to the actual speech energy in the audio.
+
+        An RMS envelope marks voiced regions; words are distributed over voiced
+        time only, so the highlight waits through real pauses and through the
+        performed cues (chuckles, gasps) instead of drifting ahead.
+        """
+        duration = len(samples) / rate
+        hop = int(rate * 0.02)
+        if hop == 0 or len(samples) < hop * 8:
+            return self._estimate_words(text, duration, prosody)
+        frame_count = len(samples) // hop
+        frames = samples[: frame_count * hop].reshape(frame_count, hop)
+        energy = np.sqrt(np.mean(frames * frames, axis=1))
+        threshold = max(float(np.percentile(energy, 15)) * 3.0, float(energy.max()) * 0.07)
+        voiced = energy > threshold
+        # Close sub-100ms dips so single words are not split apart.
+        gap = 0
+        for index in range(len(voiced)):
+            if voiced[index]:
+                if 0 < gap <= 5:
+                    voiced[index - gap : index] = True
+                gap = 0
+            else:
+                gap += 1
+        spans: list[list[float]] = []
+        start: int | None = None
+        for index, flag in enumerate(voiced):
+            if flag and start is None:
+                start = index
+            elif not flag and start is not None:
+                spans.append([start * 0.02, index * 0.02])
+                start = None
+        if start is not None:
+            spans.append([start * 0.02, frame_count * 0.02])
+        lead, trail = self._tag_reserves(duration, prosody)
+        if lead > 0:
+            spans = [span for span in spans if span[1] > lead * 0.75]
+            if spans and spans[0][0] < lead * 0.5:
+                spans[0][0] = min(spans[0][1], lead * 0.75)
+        if trail > 0:
+            cutoff = duration - trail * 0.75
+            spans = [span for span in spans if span[0] < cutoff]
+        if not spans:
+            return self._estimate_words(text, duration, prosody)
+        voiced_total = sum(end - start for start, end in spans)
+        tokens = [token for token in text.split() if token]
+        weights = [len(token) + 1 for token in tokens]
+        total = sum(weights) or 1
+
+        def absolute(position: float) -> float:
+            remaining = position
+            for span_start, span_end in spans:
+                length = span_end - span_start
+                if remaining <= length:
+                    return span_start + remaining
+                remaining -= length
+            return spans[-1][1]
+
+        words: list[dict[str, Any]] = []
+        cumulative = 0.0
+        for token, weight in zip(tokens, weights):
+            begin = absolute(cumulative / total * voiced_total)
+            cumulative += weight
+            end = absolute(cumulative / total * voiced_total)
+            words.append({"word": token, "start": round(begin, 3), "end": round(end, 3)})
+        return words
 
     def _synthesize_samples(
         self, text: str, voice: str, speed: float, prosody: Prosody | None
@@ -418,106 +519,6 @@ class OrpheusSpeechEngine(SpeechEngine):
         waveform = snac.run(None, feeds)[0]
         return np.asarray(waveform, dtype=np.float32).reshape(-1)
 
-    LEAD_TAG_SECONDS = 0.8
-    TRAIL_TAG_SECONDS = 0.7
-
-    def _tag_reserves(self, duration: float, prosody: Prosody | None) -> tuple[float, float]:
-        lead = self.LEAD_TAG_SECONDS if self.performs(prosody.lead_tag if prosody else "") else 0.0
-        trail = self.TRAIL_TAG_SECONDS if self.performs(prosody.trail_tag if prosody else "") else 0.0
-        if lead + trail > duration * 0.5 and lead + trail > 0:
-            scale = duration * 0.5 / (lead + trail)
-            lead *= scale
-            trail *= scale
-        return lead, trail
-
-    def _estimate_words(
-        self, text: str, duration: float, prosody: Prosody | None
-    ) -> list[dict[str, Any]]:
-        # Emotive tags (a chuckle, a sigh) are performed as audio before/after
-        # the words; reserve their time so the karaoke highlight stays in sync.
-        lead, trail = self._tag_reserves(duration, prosody)
-        spoken = duration - lead - trail
-        tokens = [token for token in text.split() if token]
-        weights = [len(token) + 1 for token in tokens]
-        total = sum(weights) or 1
-        words: list[dict[str, Any]] = []
-        cursor = lead
-        for token, weight in zip(tokens, weights):
-            span = spoken * weight / total
-            words.append({"word": token, "start": round(cursor, 3), "end": round(cursor + span, 3)})
-            cursor += span
-        return words
-
-    def _align_words(
-        self, text: str, samples: np.ndarray, rate: int, prosody: Prosody | None
-    ) -> list[dict[str, Any]]:
-        """Word timings aligned to the actual speech energy in the audio.
-
-        An RMS envelope marks voiced regions; words are distributed over voiced
-        time only, so the highlight waits through real pauses and through the
-        performed cues (chuckles, sighs) instead of drifting ahead.
-        """
-        duration = len(samples) / rate
-        hop = int(rate * 0.02)
-        if hop == 0 or len(samples) < hop * 8:
-            return self._estimate_words(text, duration, prosody)
-        frame_count = len(samples) // hop
-        frames = samples[: frame_count * hop].reshape(frame_count, hop)
-        energy = np.sqrt(np.mean(frames * frames, axis=1))
-        threshold = max(float(np.percentile(energy, 15)) * 3.0, float(energy.max()) * 0.07)
-        voiced = energy > threshold
-        # Close sub-100ms dips so single words are not split apart.
-        gap = 0
-        for index in range(len(voiced)):
-            if voiced[index]:
-                if 0 < gap <= 5:
-                    voiced[index - gap : index] = True
-                gap = 0
-            else:
-                gap += 1
-        spans: list[list[float]] = []
-        start: int | None = None
-        for index, flag in enumerate(voiced):
-            if flag and start is None:
-                start = index
-            elif not flag and start is not None:
-                spans.append([start * 0.02, index * 0.02])
-                start = None
-        if start is not None:
-            spans.append([start * 0.02, frame_count * 0.02])
-        lead, trail = self._tag_reserves(duration, prosody)
-        if lead > 0:
-            spans = [span for span in spans if span[1] > lead * 0.75]
-            if spans and spans[0][0] < lead * 0.5:
-                spans[0][0] = min(spans[0][1], lead * 0.75)
-        if trail > 0:
-            cutoff = duration - trail * 0.75
-            spans = [span for span in spans if span[0] < cutoff]
-        if not spans:
-            return self._estimate_words(text, duration, prosody)
-        voiced_total = sum(end - start for start, end in spans)
-        tokens = [token for token in text.split() if token]
-        weights = [len(token) + 1 for token in tokens]
-        total = sum(weights) or 1
-
-        def absolute(position: float) -> float:
-            remaining = position
-            for span_start, span_end in spans:
-                length = span_end - span_start
-                if remaining <= length:
-                    return span_start + remaining
-                remaining -= length
-            return spans[-1][1]
-
-        words: list[dict[str, Any]] = []
-        cumulative = 0.0
-        for token, weight in zip(tokens, weights):
-            begin = absolute(cumulative / total * voiced_total)
-            cumulative += weight
-            end = absolute(cumulative / total * voiced_total)
-            words.append({"word": token, "start": round(begin, 3), "end": round(end, 3)})
-        return words
-
     def performs(self, tag: str) -> bool:
         return tag in ORPHEUS_TAGS
 
@@ -741,6 +742,169 @@ def write_chunk_cache(
     timing_path(path).write_text(json.dumps(payload, ensure_ascii=False))
 
 
+GEMINI_VOICES = [
+    {"id": "Kore", "name": "Kore", "gender": "female", "accent": "american"},
+    {"id": "Aoede", "name": "Aoede", "gender": "female", "accent": "american"},
+    {"id": "Leda", "name": "Leda", "gender": "female", "accent": "american"},
+    {"id": "Puck", "name": "Puck", "gender": "male", "accent": "american"},
+    {"id": "Charon", "name": "Charon", "gender": "male", "accent": "american"},
+    {"id": "Fenrir", "name": "Fenrir", "gender": "male", "accent": "american"},
+]
+
+GEMINI_STYLE = {
+    "narrator": "Narrate like a seasoned audiobook narrator, even and engaging.",
+    "storyteller": "Narrate like a warm storyteller by a fireside.",
+    "dramatic": "Narrate with weighty, theatrical drama.",
+    "cinematic": "Narrate like an epic movie-trailer voice, low and grand.",
+    "excited": "Narrate with fast, breathless excitement.",
+    "cheerful": "Narrate brightly, upbeat and smiling.",
+    "calm": "Narrate slowly and soothingly, soft as a lullaby.",
+    "whisper": "Whisper the whole line, hushed and intimate.",
+    "mysterious": "Narrate low and mysterious, full of intrigue.",
+    "suspense": "Narrate tense and uneasy, like something is about to happen.",
+    "melancholy": "Narrate softly, heavy with sorrow.",
+    "announcer": "Narrate like a punchy stage announcer, projected and confident.",
+}
+
+GEMINI_CUES = {
+    "laugh": "Laugh briefly before the line.",
+    "chuckle": "Give a soft chuckle before the line.",
+    "gasp": "Gasp before the line.",
+    "cry": "Let a quiet sob break into the voice.",
+    "nervous": "Sound nervous and on edge.",
+    "sad": "Let real sadness show in the voice.",
+    "curious": "Sound genuinely curious.",
+    "soft": "Keep the voice gentle and tender.",
+    "happy": "Sound delighted.",
+    "excited": "Sound thrilled.",
+    "angry": "Sound angry.",
+    "shout": "Raise the voice, almost shouting.",
+    "dramatic": "Lean into the drama.",
+    "whisper": "Whisper it.",
+    "cheerful": "Sound cheerful.",
+}
+
+GEMINI_PERFORMED_CUES = {"laugh", "chuckle", "gasp", "cry"}
+
+
+class GeminiSpeechEngine(SpeechEngine):
+    """Gemini native TTS: cloud-side emotional acting on the free tier.
+
+    The model takes natural-language direction (built from the emotion preset
+    and the per-sentence acting cues) and returns 24 kHz PCM. Costs no droplet
+    memory and no money; on quota errors a circuit breaker routes pieces to
+    edge-tts so narration never stalls.
+    """
+
+    voices = GEMINI_VOICES
+    has_word_timings = False
+
+    COOLDOWN_SECONDS = 240.0
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._fallback = EdgeSpeechEngine()
+        self._cooldown_until = 0.0
+
+    def performs(self, tag: str) -> bool:
+        return tag in GEMINI_PERFORMED_CUES
+
+    def _fallback_voice(self, voice: str) -> str:
+        gender = next((v["gender"] for v in self.voices if v["id"] == voice), "female")
+        return "en-US-AriaNeural" if gender == "female" else "en-US-GuyNeural"
+
+    def _direction(self, text: str, emotion_style: str, prosody: Prosody | None) -> str:
+        parts = [emotion_style]
+        if prosody is not None:
+            for tag in (prosody.lead_tag, prosody.trail_tag):
+                cue = GEMINI_CUES.get(tag)
+                if cue and cue not in parts:
+                    parts.append(cue)
+        # Narrators breathe in quietly between lines; an audible exhale reads
+        # as unintended emotion, so forbid it unless a cue asked for one.
+        parts.append("Breathe naturally with quick quiet inhales; never sigh or exhale audibly.")
+        direction = " ".join(parts)
+        return f"{direction} Read only this text: {text}"
+
+    def _request(self, prompt: str, voice: str) -> np.ndarray:
+        import time
+        import urllib.error
+        import urllib.request
+
+        settings = get_settings()
+        url = (
+            f"https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{settings.gemini_tts_model}:generateContent?key={settings.gemini_api_key}"
+        )
+        body = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "responseModalities": ["AUDIO"],
+                "speechConfig": {
+                    "voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}
+                },
+            },
+        }
+        request = urllib.request.Request(
+            url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"}
+        )
+        part = None
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(request, timeout=120) as response:
+                    data = json.loads(response.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code == 429:
+                    self._cooldown_until = time.monotonic() + self.COOLDOWN_SECONDS
+                raise
+            try:
+                part = data["candidates"][0]["content"]["parts"][0]["inlineData"]
+                break
+            except (KeyError, IndexError):
+                # The preview model occasionally returns a candidate without
+                # audio parts; one retry almost always recovers it.
+                if attempt == 1:
+                    raise ValueError("Gemini TTS returned no audio")
+        mime = part["mimeType"]
+        rate = int(mime.split("rate=")[1].split(";")[0]) if "rate=" in mime else SAMPLE_RATE
+        samples = (
+            np.frombuffer(base64.b64decode(part["data"]), dtype="<i2").astype(np.float32)
+            / 32767.0
+        )
+        if rate != SAMPLE_RATE:
+            samples = _resample(samples, rate, SAMPLE_RATE)
+        return samples
+
+    def _synthesize_samples(
+        self, text: str, voice: str, speed: float, prosody: Prosody | None
+    ) -> tuple[np.ndarray, int, list[dict[str, Any]]]:
+        import time
+
+        emotion_style = GEMINI_STYLE.get(
+            prosody.emotion if prosody else "", GEMINI_STYLE["narrator"]
+        )
+        if time.monotonic() < self._cooldown_until:
+            return self._fallback._synthesize_samples(
+                text, self._fallback_voice(voice), speed, prosody
+            )
+        try:
+            samples = self._request(self._direction(text, emotion_style, prosody), voice)
+        except Exception as exc:
+            logger.warning("Gemini TTS failed (%s); falling back to edge-tts", exc)
+            return self._fallback._synthesize_samples(
+                text, self._fallback_voice(voice), speed, prosody
+            )
+        if abs(speed - 1.0) > 0.01:
+            samples = _atempo(samples, speed)
+        words = self._align_words(text, samples, SAMPLE_RATE, prosody)
+        return samples, SAMPLE_RATE, words
+
+
+def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    positions = np.arange(0, len(samples), source_rate / target_rate)
+    return np.interp(positions, np.arange(len(samples)), samples).astype(np.float32)
+
+
 def _create_engine() -> SpeechEngine:
     selected = get_settings().tts_engine
     if selected == "kokoro-onnx":
@@ -749,6 +913,8 @@ def _create_engine() -> SpeechEngine:
         return EdgeSpeechEngine()
     if selected == "orpheus":
         return OrpheusSpeechEngine()
+    if selected == "gemini":
+        return GeminiSpeechEngine()
     return TorchSpeechEngine()
 
 
