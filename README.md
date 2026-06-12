@@ -93,3 +93,40 @@ Worth knowing before exposing it to the internet:
 - The image is large (~9 GB) because Kokoro runs on PyTorch; swap to `kokoro-onnx` for a ~10x smaller image if you can live without word timestamps.
 - PyMuPDF is AGPL-licensed: fine for personal use, review the license before offering this as a hosted service.
 - Add a rate limiter at the proxy layer.
+
+## Roadmap
+
+Everything planned stays on free and open-source resources — self-hosted models, free-tier APIs, and infrastructure already in place. No paid services, ever.
+
+### Formats and library
+
+- **EPUB, MOBI, FB2 and CBZ support** — PyMuPDF already opens all of these; the work is relaxing the PDF magic-byte check on upload and teaching extraction about reflowable layouts. Removes the single biggest limitation of a PDF-only library.
+- **Highlights, bookmarks and notes** — extraction already stores normalized bounding boxes per block; an annotations table (book, page, block, color, note) plugs straight into the existing overlay system.
+- **Full-text search inside books** — every page's text already lives in the content store; indexing it into a Postgres `tsvector` at extraction time gives search across the whole library with jump-to-result in the reader.
+- **Open Library metadata autofill** — on upload, look the book up by title and author for a description, genre tags, and a canonical cover (free API).
+- **Named shelves and tags** — book organization beyond the current status/priority/color/favorites model.
+
+### Listening
+
+- **Audiobook export** — batch-synthesize a whole book through the existing engine and cache, then mux to `.m4b` with chapter markers taken from the TOC via ffmpeg (already in the image). Download your library as audiobooks.
+- **Resume listening position** — progress currently tracks pages; storing the last narrated chunk plus per-book voice, emotion and speed preferences lets Listen resume exactly where it stopped, sounding the way you left it.
+- **Multi-voice dialogue narration** — detect quoted dialogue in chunks (quote detection already feeds the prosody planner) and narrate it in a second voice. Kokoro and Orpheus both ship multiple voices.
+- **Multilingual narration** — edge-tts exposes hundreds of free voices across dozens of languages; detect the book's language at extraction and offer matching voices.
+
+### AI features (free tier and self-hosted only)
+
+- **Ask the book** — RAG chat over a book's content: pgvector (free Postgres extension) for storage, an int8 ONNX embedding model (all-MiniLM-L6-v2, ~23 MB, same onnxruntime already shipped for GoEmotions) for retrieval, Gemini free tier as the answerer behind the existing circuit-breaker pattern.
+- **Chapter summaries and "previously on…"** — reopening a book after days away shows a one-paragraph recap of everything up to the current page, cached per page range in the content store the same way polish results are.
+- **Reading goals and streaks** — daily streaks, pages and minutes goals, and a year-in-books recap, all computed from the reading-session rows already being written.
+
+### Hardening
+
+- **Refresh-token rotation and revocation** — tokens already carry a `jti` that nothing checks; logout should actually invalidate the refresh token via a denylist instead of only clearing cookies.
+- **Durable extraction queue** — extraction runs as an in-process background task, so a restart mid-job leaves a book stuck at `processing`. A boot-time sweep that re-queues stuck books, or a Postgres-backed queue (procrastinate), fixes both.
+- **Auto-close stale reading sessions** — sessions whose client disappeared keep `ended_at` null and silently vanish from stats; cap them at start time plus a few hours.
+- **Audio cache eviction** — narration audio accumulates per book × voice × emotion with no bound; a size-capped LRU sweep keeps small servers healthy.
+- **Password reset and email verification** — over plain SMTP, no paid mail service.
+- **In-app rate limiting** — slowapi on auth and upload endpoints instead of relying on the proxy.
+- **Per-user storage quotas** — a sum-of-file-sizes check at upload, needed before opening registration to others.
+- **pytest suite** — the Postman collection covers the API surface; the emotion planner, chunk builder and extraction classifier deserve fast unit tests too.
+- **Observability and backups** — structured logs, a Prometheus metrics endpoint, and a nightly `pg_dump` plus data-dir backup to a free object-storage tier.
