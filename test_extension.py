@@ -2,6 +2,23 @@ import uuid
 
 from app.routes.extension import _content_from_text
 from app.security import create_ws_ticket, decode_token
+from app.services.tts import FIRST_PIECE_MAX_CHARS, split_for_streaming
+
+
+def test_fast_first_piece() -> None:
+    long_open = (
+        "Although the morning had started with a great deal of confusion and noise, "
+        "everyone eventually found their seats and the meeting began on time."
+    )
+    pieces = split_for_streaming(long_open)
+    assert pieces, "expected pieces"
+    assert len(pieces[0]) <= 90, f"first piece too long for fast start: {pieces[0]!r}"
+    assert "".join(pieces).replace(" ", "") == long_open.replace(" ", "")
+
+
+def test_short_text_single_piece() -> None:
+    pieces = split_for_streaming("Read this.")
+    assert pieces == ["Read this."]
 
 
 def test_content_from_text() -> None:
@@ -35,4 +52,6 @@ if __name__ == "__main__":
     test_content_from_text()
     test_content_from_text_empty_lines()
     test_ws_ticket_roundtrip()
+    test_fast_first_piece()
+    test_short_text_single_piece()
     print("ok")

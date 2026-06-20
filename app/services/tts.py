@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 24000
 SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?;:])\s+")
+FIRST_CLAUSE_BOUNDARY = re.compile(r"(?<=[,;:—-])\s+")
 FIRST_PIECE_MAX_CHARS = 60
 PIECE_MAX_CHARS = 220
 ONNX_MODEL_FILE = "kokoro-v1.0.int8.onnx"
@@ -126,6 +127,22 @@ def split_for_streaming(text: str) -> list[str]:
             current = current[cut + 1 :]
     if current:
         pieces.append(current)
+    return _fast_first(pieces)
+
+
+def _fast_first(pieces: list[str]) -> list[str]:
+    """Split an over-long opening piece at its first clause break so audio
+    starts sooner: the short lead synthesizes fast and plays while the rest
+    streams in behind it."""
+    if not pieces or len(pieces[0]) <= FIRST_PIECE_MAX_CHARS:
+        return pieces
+    head = pieces[0]
+    clauses = FIRST_CLAUSE_BOUNDARY.split(head, maxsplit=1)
+    if len(clauses) == 2 and 8 <= len(clauses[0]) <= PIECE_MAX_CHARS:
+        return [clauses[0], clauses[1], *pieces[1:]]
+    cut = head.rfind(" ", 0, FIRST_PIECE_MAX_CHARS)
+    if cut > 8:
+        return [head[:cut], head[cut + 1 :], *pieces[1:]]
     return pieces
 
 
