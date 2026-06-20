@@ -9,6 +9,7 @@ class Settings(BaseSettings):
 
     app_name: str = "Bookly API"
     environment: str = "development"
+    log_level: str = "INFO"
     database_url: str = "postgresql+asyncpg://bookly:bookly@localhost:5432/bookly"
     jwt_secret: str = "change-me"
     access_token_minutes: int = 30

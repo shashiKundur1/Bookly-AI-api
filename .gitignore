@@ -13,3 +13,5 @@ data/
 dist/
 build/
 .DS_Store
+.cgcignore
+summaries/

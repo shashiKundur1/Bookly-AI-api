@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -7,9 +8,12 @@ from pwdlib import PasswordHash
 
 from app.config import get_settings
 
+logger = logging.getLogger(__name__)
+
 ACCESS_COOKIE = "access_token"
 REFRESH_COOKIE = "refresh_token"
 REFRESH_COOKIE_PATH = "/api/v1/auth"
+WS_TICKET_SECONDS = 60
 
 _hasher = PasswordHash.recommended()
 
@@ -39,6 +43,12 @@ def create_token_pair(user_id: uuid.UUID) -> tuple[str, str]:
     access = create_token(user_id, "access", timedelta(minutes=settings.access_token_minutes))
     refresh = create_token(user_id, "refresh", timedelta(days=settings.refresh_token_days))
     return access, refresh
+
+
+def create_ws_ticket(user_id: uuid.UUID) -> str:
+    ticket = create_token(user_id, "ws", timedelta(seconds=WS_TICKET_SECONDS))
+    logger.info("Issued ws ticket for user %s (ttl %ss)", user_id, WS_TICKET_SECONDS)
+    return ticket
 
 
 def decode_token(token: str, expected_type: str) -> uuid.UUID | None:
